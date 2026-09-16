@@ -357,6 +357,37 @@ def stream():
                     headers=resp_headers)
 
 
+@app.route("/raw")
+def raw():
+    """
+    A stable, shareable RAW url that renders INLINE (does not download) and never expires.
+    Microsoft's own content url (download.aspx) is attachment-only and its tempauth token signs
+    the query string, so it can't be made inline. Instead we re-sign server-side on every hit and
+    proxy with Content-Disposition: inline + range support — so /raw?id=... works forever (while the
+    app runs) and opens in the browser like a raw file link.
+    """
+    item_id = request.args.get("id")
+    url, err = signed_url(item_id)
+    if err:
+        return jsonify({"error": err}), 404
+    upstream_headers = {}
+    if "Range" in request.headers:
+        upstream_headers["Range"] = request.headers["Range"]
+    up = S.get(url, headers=upstream_headers, stream=True, timeout=60)
+    resp_headers = {
+        "Content-Type": up.headers.get("Content-Type", "application/octet-stream"),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": "inline",
+        "Cache-Control": "public, max-age=3600",
+    }
+    for h in ("Content-Length", "Content-Range"):
+        if h in up.headers:
+            resp_headers[h] = up.headers[h]
+    return Response(stream_with_context(up.iter_content(256 * 1024)),
+                    status=up.status_code if up.status_code in (200, 206) else 200,
+                    headers=resp_headers)
+
+
 @app.route("/text")
 def text():
     """Fetch a text file's contents server-side (avoids browser CORS for the editor)."""
@@ -804,6 +835,7 @@ tr:hover .racts{opacity:1}
     <span id="pvicon"></span><span class="pt" id="pvtitle">Preview</span><span class="pm" id="pvmeta"></span>
     <button class="tb" id="pvSave" style="display:none" onclick="saveEdit()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
     <button class="tb" id="pvRun" style="display:none" onclick="runHtml()"><i class="fa-solid fa-play"></i> Preview</button>
+    <button class="tb" id="pvRawBtn" onclick="copyRaw(pvItem&&pvItem.id)" title="Copy a raw inline link that opens in the browser instead of downloading"><i class="fa-solid fa-link"></i> Raw link</button>
     <button class="tb" onclick="pvDownload()"><i class="fa-solid fa-download"></i></button>
     <button class="ico" onclick="closePv()"><i class="fa-solid fa-xmark"></i></button>
   </div>
@@ -819,6 +851,7 @@ tr:hover .racts{opacity:1}
 <div id="ctx" class="glass">
   <div class="ci" onclick="ctxOpen()"><i class="fa-solid fa-eye"></i> Open / Preview</div>
   <div class="ci" onclick="ctxDl()"><i class="fa-solid fa-download"></i> Download</div>
+  <div class="ci" onclick="ctxRaw()"><i class="fa-solid fa-link"></i> Copy raw link</div>
   <div class="ci-sep"></div>
   <div class="ci" onclick="ctxRen()"><i class="fa-solid fa-pencil"></i> Rename</div>
   <div class="ci" onclick="ctxCopy()"><i class="fa-solid fa-copy"></i> Copy name</div>
@@ -1200,6 +1233,10 @@ function ctxOpen(){ if(ctxItem&&!ctxItem.folder)openItem(ctxItem); else if(ctxIt
 function ctxDl(){ if(ctxItem&&!ctxItem.folder)download(ctxItem.id,ctxItem.name); hideCtx(); }
 function ctxRen(){ if(ctxItem)openRename(ctxItem); hideCtx(); }
 function ctxCopy(){ if(ctxItem)navigator.clipboard.writeText(ctxItem.name); hideCtx(); }
+function ctxRaw(){ if(ctxItem&&!ctxItem.folder)copyRaw(ctxItem.id); hideCtx(); }
+// Raw inline link: opens in the browser instead of downloading, re-signs server-side so it never expires.
+function copyRaw(id){ if(!id)return; const u=location.origin+'/raw?id='+encodeURIComponent(id);
+  navigator.clipboard.writeText(u).then(()=>toast('Raw link copied — opens inline, never expires')).catch(()=>toast(u)); }
 function ctxDel(){ if(ctxItem)delOne(ctxItem.id); hideCtx(); }
 document.addEventListener('click',hideCtx);
 document.addEventListener('keydown',e=>{ if(e.key==='Escape'){closePv();closeMask('renM');hideCtx();} });

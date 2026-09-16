@@ -65,6 +65,8 @@ python test_suite.py https://your.app # against a deployed instance
   sign-in — that's a tenant policy, not a bug.
 - Single-stream browser upload tops out around ~13 MB/s (OneDrive HTTP/2 flow control); Turbo ~2×.
 - Microsoft's download token is **attachment-only** by design — there is no URL tweak for an inline
-  "raw" view (the token signs the query string; edits return 401). Instead, the **Raw link** button
-  copies a `/raw?id=…` URL served by the app: `Content-Disposition: inline`, range-seekable, and it
-  re-signs on every hit so it **never expires** — opens in the browser instead of downloading.
+  "raw" view (the token signs the query string; edits return 401). The **Raw link** button copies a
+  `/view?id=…` URL: a ~3 KB HTML shell that renders the file via a media tag / `fetch`→blob pointing
+  **straight at the CDN**, so the bytes go browser↔CDN direct — **zero host egress**, renders inline
+  instead of downloading, and never expires (re-signs each load). (`/raw?id=…` still exists as a
+  byte-level inline proxy for when you need a direct-bytes URL, e.g. embedding in someone else's `<img>`.)

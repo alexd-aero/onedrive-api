@@ -388,6 +388,62 @@ def raw():
                     headers=resp_headers)
 
 
+VIEW_HTML = r"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ name }}</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0910;color:#e8e8f2;font-family:system-ui,'Segoe UI',sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #wrap img,#wrap video{max-width:100%;max-height:100%;object-fit:contain}
+  #wrap iframe{width:100%;height:100%;border:none;background:#fff}
+  #wrap audio{width:min(600px,90%)}
+  #wrap pre{margin:0;padding:26px;width:100%;height:100%;overflow:auto;box-sizing:border-box;white-space:pre-wrap;word-break:break-word;font-family:'Consolas',monospace;font-size:14px;line-height:1.6;color:#cdd3e0}
+  .msg{color:#8b8ba7;font-size:15px;text-align:center;padding:40px}
+  .msg a{color:#7c6cff}
+  .sp{width:22px;height:22px;border:3px solid #2a2a3a;border-top-color:#7c6cff;border-radius:50%;animation:s .7s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style></head><body>
+<div id="wrap"><div class="sp"></div></div>
+<script>
+const U={{ url|tojson }}, NAME={{ name|tojson }};
+const ext=(NAME.split('.').pop()||'').toLowerCase();
+const IMG=new Set(['jpg','jpeg','png','gif','webp','bmp','svg','avif','ico']);
+const VID=new Set(['mp4','webm','mov','mkv','m4v','ogv']);
+const AUD=new Set(['mp3','wav','ogg','flac','aac','m4a','opus']);
+const TXT=new Set(['txt','md','markdown','py','js','ts','tsx','jsx','css','json','xml','csv','sh','yaml','yml','log','ini','toml','rs','go','c','cpp','h','java','php','rb','sql','conf']);
+const w=document.getElementById('wrap');
+(async()=>{ try{
+  if(IMG.has(ext)){ w.innerHTML='<img>'; w.firstChild.src=U; }
+  else if(VID.has(ext)){ w.innerHTML='<video controls autoplay playsinline></video>'; w.firstChild.src=U; }
+  else if(AUD.has(ext)){ w.innerHTML='<audio controls autoplay></audio>'; w.firstChild.src=U; }
+  else if(TXT.has(ext)){ const t=await fetch(U).then(r=>r.text()); const p=document.createElement('pre'); p.textContent=t; w.innerHTML=''; w.appendChild(p); }
+  else { /* pdf, html, anything: fetch->blob so attachment disposition can't force a download */
+    const b=await fetch(U).then(r=>r.blob()); const o=URL.createObjectURL(b);
+    const f=document.createElement('iframe'); f.src=o; w.innerHTML=''; w.appendChild(f);
+  }
+}catch(e){ w.innerHTML='<div class="msg">Could not render inline.<br><a href="'+U+'">Open / download instead</a></div>'; }
+})();
+</script></body></html>"""
+
+
+@app.route("/view")
+def view():
+    """
+    Zero-egress inline viewer. Returns a ~1KB HTML shell that renders the file via a media tag /
+    fetch->blob pointing STRAIGHT at Microsoft's CDN — the bytes go browser<->CDN direct (no host
+    egress), while a plain top-level nav to the raw CDN url would download (attachment disposition).
+    Re-signs on every load, so the link never expires.
+    """
+    item_id = request.args.get("id")
+    data = gh(f"/me/drive/items/{item_id}")
+    if "error" in data:
+        return ("Not found", 404)
+    url = data.get("@microsoft.graph.downloadUrl")
+    if not url:
+        return ("No inline content for this item", 404)
+    return render_template_string(VIEW_HTML, url=url, name=data.get("name", "file"))
+
+
 @app.route("/text")
 def text():
     """Fetch a text file's contents server-side (avoids browser CORS for the editor)."""
@@ -1234,9 +1290,10 @@ function ctxDl(){ if(ctxItem&&!ctxItem.folder)download(ctxItem.id,ctxItem.name);
 function ctxRen(){ if(ctxItem)openRename(ctxItem); hideCtx(); }
 function ctxCopy(){ if(ctxItem)navigator.clipboard.writeText(ctxItem.name); hideCtx(); }
 function ctxRaw(){ if(ctxItem&&!ctxItem.folder)copyRaw(ctxItem.id); hideCtx(); }
-// Raw inline link: opens in the browser instead of downloading, re-signs server-side so it never expires.
-function copyRaw(id){ if(!id)return; const u=location.origin+'/raw?id='+encodeURIComponent(id);
-  navigator.clipboard.writeText(u).then(()=>toast('Raw link copied — opens inline, never expires')).catch(()=>toast(u)); }
+// Raw inline link -> /view: a tiny shell that streams bytes browser<->CDN direct (ZERO host egress),
+// renders inline instead of downloading, and never expires (re-signs each load).
+function copyRaw(id){ if(!id)return; const u=location.origin+'/view?id='+encodeURIComponent(id);
+  navigator.clipboard.writeText(u).then(()=>toast('Raw link copied — opens inline, zero server bandwidth, never expires')).catch(()=>toast(u)); }
 function ctxDel(){ if(ctxItem)delOne(ctxItem.id); hideCtx(); }
 document.addEventListener('click',hideCtx);
 document.addEventListener('keydown',e=>{ if(e.key==='Escape'){closePv();closeMask('renM');hideCtx();} });

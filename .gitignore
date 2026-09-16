@@ -1,0 +1,13 @@
+# secrets — NEVER commit
+.env
+*.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# runtime
+cloudflared.log
+*.log

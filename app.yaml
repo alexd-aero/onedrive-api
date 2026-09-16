@@ -1,0 +1,9 @@
+# Wasmer Edge app manifest.  Deploy with:  wasmer deploy
+kind: wasmer.io/App.v0
+name: onedrive-api
+package: .
+env:
+  # Leave TURBO_UPLOAD unset on Wasmer: direct browser->Microsoft uploads use ~0 host
+  # bandwidth. Streaming/previews already go straight from Microsoft's CDN, so a month of
+  # heavy use barely touches the bandwidth cap.
+  PORT: "80"

@@ -260,11 +260,17 @@ def save_env():
         f"EXPIRES_AT={int(TOKENS['expires_at'])}",
         f"EMAIL={TOKENS['email'] or ''}",
     ]
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    try:
+        with open(ENV_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass  # read-only FS (Wasmer): the token lives in memory + token.yml, .env is optional
 
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
+REFRESH_ERR = {"msg": None}
+
+
 def apply_token_response(res):
     """Store a token endpoint response. Returns True on success."""
     if "access_token" not in res:
@@ -293,20 +299,25 @@ def refresh_now():
             "scope": SCOPES,
         }, timeout=20).json()
     except Exception as e:
-        print(f"[refresh] network error: {e}")
+        REFRESH_ERR["msg"] = f"network/SSL error contacting Microsoft: {e}"
+        print(f"[refresh] {REFRESH_ERR['msg']}")
         return False
     if not apply_token_response(res):
-        print(f"[refresh] failed: {res.get('error_description', res)}")
+        REFRESH_ERR["msg"] = res.get("error_description") or str(res)
+        print(f"[refresh] failed: {REFRESH_ERR['msg']}")
         return False
+    REFRESH_ERR["msg"] = None
     print(f"[refresh] token refreshed, valid until {time.strftime('%H:%M:%S', time.localtime(TOKENS['expires_at']))}")
     return True
 
 
 def valid_token():
-    """Return a non-expired access token, refreshing if needed."""
-    if not TOKENS["access_token"]:
+    """Return a non-expired access token, minting one from the refresh token when needed.
+    Must refresh when the access token is MISSING (fresh WSGI/cold start never ran main()'s
+    startup refresh) — not only when it's near expiry — or Graph gets `Bearer None`."""
+    if not TOKENS.get("refresh_token"):
         return None
-    if time.time() > TOKENS["expires_at"] - 120:
+    if not TOKENS["access_token"] or time.time() > TOKENS["expires_at"] - 120:
         refresh_now()
     return TOKENS["access_token"]
 
@@ -334,7 +345,14 @@ def H():
     return {"Authorization": f"Bearer {valid_token()}"}
 
 
+def _token_err():
+    return ("Could not get a Microsoft access token. "
+            + (REFRESH_ERR["msg"] or "The stored refresh token may be invalid — reconnect the account."))
+
+
 def gh(path):
+    if not valid_token():
+        return {"error": {"message": _token_err()}}
     return S.get(f"{GRAPH}{path}", headers=H(), timeout=30).json()
 
 
@@ -2142,6 +2160,11 @@ def boot():
     load_accounts()
     if ACCOUNTS:
         print(f"[boot] token.yml loaded: {len(ACCOUNTS)} account(s), method={CREDS.get('method') if CREDS else '?'}")
+        if token_available():
+            try:
+                refresh_now()   # eager: so the first request isn't slow and WSGI hosts work without main()
+            except Exception as e:
+                print(f"[boot] eager refresh skipped: {e}")
     elif not TOKENCFG:
         # Legacy local .env fallback (pre-GitOps dev sessions) when no token.yml exists.
         env = load_env()

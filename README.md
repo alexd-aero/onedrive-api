@@ -8,7 +8,10 @@ straight from Microsoft's CDN**, an Ace code editor, and custom media players.
 
 ## Features
 
-- **In-app auth** — device-code flow right in the UI (code + link + live yellow→green status).
+- **Self-hosted auth gate** — a setup screen locks the whole instance behind a username + password
+  (Basic, or **AES-256-GCM Secure** mode that encrypts the Microsoft token at rest with your
+  password). All crypto runs in the browser (Web Crypto); every API route is session-gated.
+- **In-app Microsoft auth** — device-code flow right in the UI (code + link + live yellow→green status).
   No app registration; uses Microsoft's own *Graph Command Line Tools* public client, which is
   pre-authorized for `Files.ReadWrite.All`. Tokens persist to `.env` and refresh every 10 min.
 - **Raw streaming, ~0 host bandwidth** — video, audio, images, PDF and the editor's text load
@@ -23,40 +26,60 @@ straight from Microsoft's CDN**, an Ace code editor, and custom media players.
   audio player with a real WebAudio FFT visualizer (works off the cross-origin CDN stream).
 - Grid thumbnails, hover-prefetch (instant preview), drag-and-drop upload, sort/filter, context menu.
 
+## Setup model (GitOps)
+
+Config lives in **two files in the repo root**: `creds.yml` (your login) and `token.yml` (the
+Microsoft token). They ship as placeholders. The in-app setup screen generates a code for each; you
+paste it into the file and commit. This is deliberate — hosts like Wasmer have an ephemeral
+filesystem, so config can't be written at runtime; committing it to your **private** fork is the
+durable store. (Running locally, the files are also written for you automatically.)
+
+## Deploy to Wasmer
+
+1. **Fork this repo**, then `git clone` your fork.
+2. On GitHub: **Settings → General → Danger Zone → "Leave fork network"** (unlink from the upstream
+   fork network). **Wait for it to finish.**
+3. Then, still in **Danger Zone**, set the repo to **Private**. *(Do this before adding any tokens —
+   `creds.yml`/`token.yml` will hold secrets.)*
+4. Go to **wasmer.app → Deploy → connect this GitHub repo**. Let Wasmer **auto-detect the
+   environment** (it reads `wasmer.toml` / `app.yaml`). Deploy.
+5. Open your app URL. `/` shows the **setup screen**:
+   - **Step 1 — Credentials.** Pick **Basic** or **Secure** (AES-256-GCM), set a username + password.
+     It gives you a code (auto-copied). In your fork, open **`creds.yml`** in the root, **replace the
+     whole file** with the code, commit → Wasmer redeploys.
+   - **Log in** with those credentials.
+   - **Step 2 — Microsoft.** Click connect, enter the device code at the link, approve. It gives you a
+     second code (auto-copied). Replace the whole of **`token.yml`** with it, commit → redeploy.
+6. Done. Log in and use it. The Microsoft token is **effectively permanent** — it self-refreshes and
+   rides a ~90-day sliding window, so it only needs re-connecting if you change your Microsoft
+   password, revoke access, or leave it unused for 90+ days.
+
+**Basic vs Secure:** *Basic* — password gates the UI; the app runs headless after each deploy.
+*Secure* — the Microsoft token in `token.yml` is AES-256-GCM encrypted with your password (all crypto
+runs in your browser via Web Crypto), so the repo alone can't unlock OneDrive; the tradeoff is you log
+in once after each cold-start to decrypt it.
+
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
-python app.py           # http://localhost:3000
-TURBO_UPLOAD=1 python app.py   # enable faster host-proxied uploads (uses host bandwidth)
+python app.py                  # http://localhost:3000, then do the setup screen (files written for you)
+TURBO_UPLOAD=1 python app.py   # faster host-proxied uploads (uses host bandwidth; fine locally)
 ```
 
-Open the URL, click **Sign in with Microsoft**, enter the code at the link shown. Done.
-
-## Deploy
-
-**Wasmer Edge** (keep Turbo OFF so streaming/uploads don't touch the bandwidth cap):
-```bash
-wasmer deploy
-```
-
-**Docker / any PaaS** (Render, Railway, Fly, …):
-```bash
-docker build -t onedrive-api . && docker run -p 8080:8080 onedrive-api
-```
-Runs `gunicorn -w 1 --threads 8 app:app` (single worker: the token + device-code poller live in
-one process; scale with threads, not workers).
-
-> First sign-in on a fresh deploy happens in the browser. To pre-seed a deployment, copy a working
-> `.env` (contains `REFRESH_TOKEN`) into the container — it is **git-ignored** and must never be committed.
+**Docker / any PaaS** (Render, Railway, Fly, …): `docker build -t onedrive-api . && docker run -p 8080:8080 onedrive-api`
+— runs `gunicorn -w 1 --threads 8 app:app` (single worker: token + device-code poller live in one
+process; scale with threads, not workers).
 
 ## Test
 
 ```bash
-python test_suite.py                  # smoke + stress against localhost (must be signed in)
-python test_suite.py --upload=512     # add a 512 MiB upload benchmark
-python test_suite.py https://your.app # against a deployed instance
+python test_suite.py --user alex --pass yourpass            # smoke + stress (24 checks)
+python test_suite.py --user alex --pass yourpass --upload=512   # add a 512 MiB upload benchmark
+python test_suite.py https://your.app --user alex --pass yourpass
 ```
+Covers auth gating (unauth blocked, wrong-password rejected), login/session, latency, CRUD,
+range streaming, `/raw` + `/view`, and 25-way concurrency.
 
 ## Notes / limits
 

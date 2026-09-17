@@ -31,7 +31,9 @@ import hashlib
 import secrets
 import threading
 import functools
+import concurrent.futures as cf
 import requests
+from urllib.parse import quote
 from flask import (
     Flask, request, jsonify, render_template_string, Response,
     stream_with_context, redirect, make_response,
@@ -55,6 +57,10 @@ GRAPH      = "https://graph.microsoft.com/v1.0"
 # Turbo upload = stream browser->host->Microsoft (~44 MB/s but uses host egress).
 # Off by default so a Wasmer deploy doesn't burn its bandwidth cap; set TURBO_UPLOAD=1 locally.
 TURBO      = os.environ.get("TURBO_UPLOAD", "0") == "1"
+# Files at/below this go up in ONE request (Graph's simple PUT) instead of a resumable
+# session. Graph allows 250 MB for simple uploads; 8 MiB keeps a single retry cheap while
+# covering the bulk-of-many-small-files case that trips the createUploadSession throttle.
+SMALL_UPLOAD_MAX = int(os.environ.get("SMALL_UPLOAD_MAX", 8 * 1024 * 1024))
 
 # One pooled session for ALL outbound calls (Graph, CDN, upload proxy). Keeps TLS warm
 # to graph.microsoft.com so /ls, /link etc. don't pay a fresh handshake every request.
@@ -350,24 +356,79 @@ def _token_err():
             + (REFRESH_ERR["msg"] or "The stored refresh token may be invalid — reconnect the account."))
 
 
+# Graph throttles hard on bursts (a 25-file upload trips it at ~20 createUploadSession
+# calls) and answers 429 + Retry-After. Every Graph call goes through this so one throttled
+# response is a short wait, not a lost file.
+GRAPH_RETRIES = 4
+RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def retry_after(resp, attempt):
+    """Seconds to wait, preferring Graph's own hint; capped so a request can't hang forever."""
+    hint = resp.headers.get("Retry-After")
+    if hint:
+        try:
+            return min(float(hint), 20.0)
+        except ValueError:
+            pass
+    try:
+        body = resp.json()
+        secs = (body.get("error") or {}).get("retryAfterSeconds")
+        if secs:
+            return min(float(secs), 20.0)
+    except Exception:
+        pass
+    return min(0.5 * (2 ** attempt), 8.0)   # exponential backoff fallback
+
+
+def graph_req(method, path, *, retries=GRAPH_RETRIES, **kw):
+    """One Graph request with throttle-aware retries. Returns the final Response."""
+    url = path if path.startswith("http") else f"{GRAPH}{path}"
+    kw.setdefault("timeout", 30)
+    extra = kw.pop("_headers", None) or {}   # popped once: retries must keep Content-Type
+    resp = None
+    for attempt in range(retries + 1):
+        resp = S.request(method, url, headers={**H(), **extra}, **kw)
+        if resp.status_code not in RETRY_STATUS or attempt == retries:
+            return resp
+        wait = retry_after(resp, attempt)
+        print(f"[graph] {method} {path} -> {resp.status_code}, retrying in {wait:.1f}s "
+              f"({attempt + 1}/{retries})")
+        time.sleep(wait)
+    return resp
+
+
+def _json(resp):
+    try:
+        return resp.json()
+    except ValueError:
+        return {"error": {"code": str(resp.status_code),
+                          "message": (resp.text or "non-JSON response")[:200]}}
+
+
 def gh(path):
     if not valid_token():
         return {"error": {"message": _token_err()}}
-    return S.get(f"{GRAPH}{path}", headers=H(), timeout=30).json()
+    return _json(graph_req("GET", path))
 
 
 def gd(path):
-    return S.delete(f"{GRAPH}{path}", headers=H(), timeout=30)
+    return graph_req("DELETE", path)
 
 
 def gpost(path, body=None):
-    return S.post(f"{GRAPH}{path}", headers={**H(), "Content-Type": "application/json"},
-                         json=body, timeout=30).json()
+    return _json(graph_req("POST", path, _headers={"Content-Type": "application/json"},
+                           json=body))
+
+
+def gput(path, data, content_type="application/octet-stream"):
+    return _json(graph_req("PUT", path, _headers={"Content-Type": content_type}, data=data,
+                           timeout=300))
 
 
 def gpatch(path, body=None):
-    return S.patch(f"{GRAPH}{path}", headers={**H(), "Content-Type": "application/json"},
-                          json=body, timeout=30).json()
+    return _json(graph_req("PATCH", path, _headers={"Content-Type": "application/json"},
+                           json=body))
 
 
 def signed_url(item_id):
@@ -414,6 +475,44 @@ def poll_device(device_code, interval):
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # uploads go direct to MS; proxy chunks are bounded
+
+
+class ForwardedPrefix:
+    """
+    Trust the standard reverse-proxy headers.
+
+    Behind nginx / Caddy / Cloudflare / a school proxy the app sees plain http on `/`, while
+    the browser sees https on `/some/prefix`. Without this, `request.is_secure` is wrong (so
+    the session cookie's Secure flag is wrong) and anything the app builds from the request
+    path points outside the prefix.
+    """
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        proto = environ.get("HTTP_X_FORWARDED_PROTO")
+        if proto:
+            environ["wsgi.url_scheme"] = proto.split(",")[0].strip()
+        host = environ.get("HTTP_X_FORWARDED_HOST")
+        if host:
+            environ["HTTP_HOST"] = host.split(",")[0].strip()
+        prefix = environ.get("HTTP_X_FORWARDED_PREFIX")
+        if prefix:
+            prefix = "/" + prefix.strip().strip("/")
+            environ["SCRIPT_NAME"] = prefix
+            path = environ.get("PATH_INFO", "")
+            if path.startswith(prefix):
+                environ["PATH_INFO"] = path[len(prefix):] or "/"
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = ForwardedPrefix(app.wsgi_app)
+
+
+def base_prefix():
+    """The path the browser reaches this app on ('' when mounted at the root)."""
+    return (request.headers.get("X-Forwarded-Prefix") or request.script_root or "").rstrip("/")
 
 
 @app.route("/status")
@@ -654,7 +753,7 @@ def ls():
 @app.route("/config")
 @require_auth
 def config():
-    return jsonify({"turbo": TURBO})
+    return jsonify({"turbo": TURBO, "small_max": SMALL_UPLOAD_MAX})
 
 
 @app.route("/link")
@@ -824,10 +923,9 @@ def text():
 def save():
     """Overwrite an existing file's contents (editor save)."""
     d = request.get_json()
-    r = S.put(f"{GRAPH}/me/drive/items/{d['id']}/content",
-                     headers={**H(), "Content-Type": "text/plain"},
-                     data=d["content"].encode("utf-8"), timeout=60)
-    return jsonify({"ok": r.status_code in (200, 201)})
+    res = gput(f"/me/drive/items/{d['id']}/content",
+               d["content"].encode("utf-8"), "text/plain")
+    return jsonify({"ok": "id" in res, "error": res.get("error")})
 
 
 @app.route("/newfile", methods=["POST"])
@@ -835,13 +933,11 @@ def save():
 def newfile():
     d = request.get_json()
     pid, name = d.get("parent_id", "root"), d["name"]
-    if pid == "root":
-        path = f"/me/drive/root:/{name}:/content"
-    else:
-        path = f"/me/drive/items/{pid}:/{name}:/content"
-    r = S.put(f"{GRAPH}{path}", headers={**H(), "Content-Type": "text/plain"},
-                     data=d.get("content", "").encode("utf-8"), timeout=60)
-    return jsonify({"ok": r.status_code in (200, 201)})
+    res = gput(f"{_item_path(pid, name)}/content",
+               (d.get("content") or "").encode("utf-8"), "text/plain")
+    # Return the id so the browser can show the file immediately instead of waiting on a
+    # re-list that Graph may still answer from a stale view.
+    return jsonify({"ok": "id" in res, "id": res.get("id"), "error": res.get("error")})
 
 
 @app.route("/mkdir", methods=["POST"])
@@ -851,65 +947,191 @@ def mkdir():
     pid = d["parent_id"]
     path = "/me/drive/root/children" if pid == "root" else f"/me/drive/items/{pid}/children"
     res = gpost(path, {"name": d["name"], "folder": {}, "@microsoft.graph.conflictBehavior": "rename"})
-    return jsonify({"ok": "id" in res, "id": res.get("id")})
+    return jsonify({"ok": "id" in res, "id": res.get("id"), "name": res.get("name", d["name"])})
 
 
 @app.route("/rename", methods=["POST"])
 @require_auth
 def rename():
     d = request.get_json()
-    gpatch(f"/me/drive/items/{d['id']}", {"name": d["name"]})
-    return jsonify({"ok": True})
+    res = gpatch(f"/me/drive/items/{d['id']}", {"name": d["name"]})
+    return jsonify({"ok": "id" in res, "error": res.get("error")})
 
 
 @app.route("/delete", methods=["DELETE"])
 @require_auth
 def delete():
-    gd(f"/me/drive/items/{request.args.get('id')}")
-    return jsonify({"ok": True})
+    r = gd(f"/me/drive/items/{request.args.get('id')}")
+    ok = r.status_code in (200, 204, 404)   # 404 == already gone, which is success here
+    return jsonify({"ok": ok, "status": r.status_code}), (200 if ok else 502)
+
+
+@app.route("/delete/batch", methods=["POST"])
+@require_auth
+def delete_batch():
+    """
+    Delete many items in one call, in parallel. Deleting a 20-item selection used to be 20
+    sequential browser round-trips (each one a full Graph delete), so the UI sat there for
+    seconds. Bounded fan-out keeps it to roughly one round-trip of wall time without
+    hammering Graph hard enough to get throttled.
+    """
+    ids = (request.get_json() or {}).get("ids") or []
+    if not ids:
+        return jsonify({"ok": False, "error": "no ids"}), 400
+    results = {}
+
+    def one(iid):
+        try:
+            r = gd(f"/me/drive/items/{iid}")
+            results[iid] = r.status_code in (200, 204, 404)
+        except requests.RequestException:
+            results[iid] = False
+
+    with cf.ThreadPoolExecutor(max_workers=min(8, len(ids))) as ex:
+        list(ex.map(one, ids))
+    failed = [i for i, v in results.items() if not v]
+    return jsonify({"ok": not failed, "deleted": [i for i, v in results.items() if v],
+                    "failed": failed})
 
 
 # ── Upload: browser talks straight to Microsoft ───────────────────────────────
+def _item_path(pid, name):
+    """Graph addresses items by path; the name must be URL-escaped or `#`, `?`, `%` break it."""
+    safe = quote(name, safe="")
+    return (f"/me/drive/root:/{safe}:" if pid == "root"
+            else f"/me/drive/items/{pid}:/{safe}:")
+
+
 @app.route("/upload/session", methods=["POST"])
 @require_auth
 def upload_session():
     """Create a resumable upload session; the browser PUTs chunks straight to Microsoft."""
-    d = request.get_json()
-    pid, name = d.get("parent_id", "root"), d["name"]
-    if pid == "root":
-        path = f"/me/drive/root:/{name}:/createUploadSession"
-    else:
-        path = f"/me/drive/items/{pid}:/{name}:/createUploadSession"
-    res = gpost(path, {"item": {"@microsoft.graph.conflictBehavior": "replace",
-                                "name": name}})
+    d = request.get_json() or {}
+    pid, name = d.get("parent_id", "root"), d.get("name")
+    if not name:
+        return jsonify({"ok": False, "error": "missing name"}), 400
+    res = gpost(f"{_item_path(pid, name)}/createUploadSession",
+                {"item": {"@microsoft.graph.conflictBehavior": "replace", "name": name}})
     if "uploadUrl" not in res:
-        return jsonify({"ok": False, "error": res.get("error", res)})
+        err = res.get("error", res)
+        code = (err or {}).get("code") if isinstance(err, dict) else None
+        # graph_req already retried the throttle; tell the browser it may retry too
+        status = 429 if code in ("activityLimitReached", "serviceNotAvailable") else 502
+        return jsonify({"ok": False, "error": err, "retryable": status == 429}), status
     return jsonify({"ok": True, "uploadUrl": res["uploadUrl"]})
+
+
+@app.route("/upload/small", methods=["PUT"])
+@require_auth
+def upload_small():
+    """
+    Single-shot upload for small files. A resumable session per file is what trips Graph's
+    burst throttle on bulk uploads (~20 createUploadSession calls), and it costs 2 extra
+    round-trips per file. Graph's simple PUT has no such limit, so anything under
+    SMALL_UPLOAD_MAX goes straight to /content in one request.
+    """
+    pid = request.args.get("parent_id", "root")
+    name = request.args.get("name")
+    if not name:
+        return jsonify({"ok": False, "error": "missing name"}), 400
+    data = request.get_data()
+    if len(data) > SMALL_UPLOAD_MAX:
+        return jsonify({"ok": False, "error": "too large for single-shot"}), 413
+    res = gput(f"{_item_path(pid, name)}/content", data,
+               request.headers.get("Content-Type") or "application/octet-stream")
+    if "id" not in res:
+        err = res.get("error", res)
+        code = (err or {}).get("code") if isinstance(err, dict) else None
+        status = 429 if code in ("activityLimitReached", "serviceNotAvailable") else 502
+        return jsonify({"ok": False, "error": err, "retryable": status == 429}), status
+    return jsonify({"ok": True, "id": res["id"], "name": res.get("name", name),
+                    "size": res.get("size", len(data))})
+
+
+class SizedStream:
+    """
+    A read()-able that also reports its length.
+
+    Handing `requests` a bare stream makes it fall back to `Transfer-Encoding: chunked`,
+    which Microsoft's upload sessions reject outright (and which the fragment protocol
+    can't express anyway — it needs Content-Range against a known size). Exposing __len__
+    lets requests set a real Content-Length and still stream the body through.
+    """
+
+    def __init__(self, stream, length):
+        self._s, self._len = stream, length
+
+    def __len__(self):
+        return self._len
+
+    def read(self, n=-1):
+        return self._s.read() if n is None or n < 0 else self._s.read(n)
+
+    def __iter__(self):
+        while True:
+            block = self._s.read(64 * 1024)
+            if not block:
+                return
+            yield block
 
 
 @app.route("/upload/proxy", methods=["PUT"])
 @require_auth
 def upload_proxy():
-    """Fallback: forward one chunk to the upload session when the browser is CORS-blocked."""
+    """
+    Turbo / CORS fallback: forward one fragment to the upload session.
+
+    The body is *streamed* through (browser -> host -> Microsoft) instead of being read
+    into memory first. Store-and-forward meant the host buffered the whole fragment (20 MiB)
+    before sending a single byte upstream, which on a small host is both a memory spike and
+    a dead browser leg for the entire upstream send. Streaming overlaps the two legs and
+    keeps host memory flat regardless of fragment size.
+    """
     upload_url = request.args.get("url")
     if not upload_url:
         return jsonify({"error": "missing url"}), 400
     headers = {}
-    if request.headers.get("Content-Range"):
-        headers["Content-Range"] = request.headers["Content-Range"]
-    chunk = request.get_data()
-    headers["Content-Length"] = str(len(chunk))
-    r = S.put(upload_url, headers=headers, data=chunk, timeout=300)
-    return Response(r.content, status=r.status_code,
-                    content_type=r.headers.get("Content-Type", "application/json"))
+    for h in ("Content-Range", "Content-Type"):
+        if request.headers.get(h):
+            headers[h] = request.headers[h]
+    # Stream it through with a known length: no host-side buffering, no chunked encoding.
+    length = request.content_length
+    body = SizedStream(request.stream, length) if length else request.get_data()
+    try:
+        r = S.put(upload_url, headers=headers, data=body, timeout=600)
+    except requests.RequestException as e:
+        return jsonify({"error": f"upstream: {e}"}), 502
+    out = Response(r.content, status=r.status_code,
+                   content_type=r.headers.get("Content-Type", "application/json"))
+    if r.headers.get("Retry-After"):
+        out.headers["Retry-After"] = r.headers["Retry-After"]
+    return out
+
+
+@app.route("/upload/cancel", methods=["POST"])
+@require_auth
+def upload_cancel():
+    """
+    Abandon an upload session. Personal OneDrive reserves the name the moment a session
+    opens, so a session that is created and never finished leaves a 0-byte file sitting in
+    the folder. The browser calls this whenever it gives up on a file.
+    """
+    url = (request.get_json() or {}).get("url")
+    if not url:
+        return jsonify({"ok": False, "error": "missing url"}), 400
+    try:
+        r = S.delete(url, timeout=30)
+        return jsonify({"ok": r.status_code in (200, 204, 404)})
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 
 @app.route("/")
 def index():
     # The app only when configured, logged in, AND the token is usable (secure mode must be unlocked).
     if app_state() == "ready" and is_authed() and token_available():
-        return render_template_string(HTML)
-    return render_template_string(GATE_HTML)
+        return render_template_string(HTML, base=base_prefix())
+    return render_template_string(GATE_HTML, base=base_prefix())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -921,6 +1143,24 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Nimbus</title>
+<script>
+/* ── Reverse-proxy base path ──────────────────────────────────────────────────
+   Mounted under a prefix (https://host/od) every root-relative request escaped the
+   prefix and 404'd — including the very first /api/state, which left the gate with no
+   panel shown at all (a blank card). Resolve the prefix once, then rebase fetch + XHR so
+   every call site stays correct without having to know about it. */
+window.__BASE__ = {{ base|tojson }};
+const BASE = (window.__BASE__ || location.pathname.replace(/\/+$/, '') || '');
+const U = p => (typeof p === 'string' && p[0] === '/' ? BASE + p : p);
+if (BASE) {
+  const _fetch = window.fetch;
+  window.fetch = (u, o) => _fetch(U(u), o);
+  const _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+    return _open.call(this, m, U(u), ...rest);
+  };
+}
+</script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ext-modelist.min.js"></script>
@@ -1055,9 +1295,12 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 table{width:100%;border-collapse:collapse}
 thead th{position:sticky;top:0;background:rgba(20,20,34,.9);backdrop-filter:blur(8px);padding:10px 14px;font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:.07em;text-align:left;cursor:pointer;user-select:none;z-index:2}
 thead th:hover{color:var(--text1)}
-tbody tr{border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;transition:background .1s}
+tbody tr{border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;
+  transition:background .18s ease,box-shadow .18s ease,transform .18s cubic-bezier(.2,.9,.25,1)}
 tbody tr:hover{background:rgba(255,255,255,.04)}
-tbody tr.sel{background:var(--accent-glow)}
+/* Selection is a transition, not a re-render: the row eases into the highlight in place. */
+tbody tr.sel{background:var(--accent-glow);box-shadow:inset 3px 0 0 var(--accent)}
+tbody tr.gone{opacity:0;transform:translateX(-14px);transition:opacity .16s ease,transform .16s ease}
 td{padding:9px 14px;font-size:.86rem}
 .c-chk{width:38px}.c-ic{width:34px;padding-right:0!important}
 .c-size{width:96px;text-align:right;color:var(--text2);font-variant-numeric:tabular-nums;font-size:.8rem}
@@ -1078,7 +1321,9 @@ tr:hover .racts{opacity:1}
 #grid{display:none;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;padding:16px}
 .gi{position:relative;border-radius:var(--radius);border:1px solid var(--stroke);background:rgba(255,255,255,.03);padding:18px 12px 13px;display:flex;flex-direction:column;align-items:center;gap:11px;cursor:pointer;transition:.15s;text-align:center}
 .gi:hover{background:rgba(255,255,255,.06);transform:translateY(-2px)}
-.gi.sel{border-color:var(--accent);background:var(--accent-glow)}
+.gi.sel{border-color:var(--accent);background:var(--accent-glow);transform:translateY(-3px);
+  box-shadow:0 10px 26px rgba(124,108,255,.28)}
+.gi.gone{opacity:0;transform:scale(.92);transition:opacity .16s ease,transform .16s ease}
 .gi .fi{font-size:38px}
 .gi .gn{font-size:.78rem;word-break:break-word;line-height:1.35}
 .gi .gs{font-size:.7rem;color:var(--text2)}
@@ -1198,9 +1443,9 @@ tr:hover .racts{opacity:1}
 #pv.open #pvbox{animation:pvIn .34s cubic-bezier(.2,.9,.25,1)}
 @keyframes pvIn{from{opacity:0;transform:translateY(14px) scale(.975)}to{opacity:1;transform:none}}
 .mask.open .dlg{animation:pvIn .3s cubic-bezier(.2,.9,.25,1)}
-#tbody tr{animation:rowIn .32s ease both}
+#area.fresh #tbody tr{animation:rowIn .32s ease both}
 @keyframes rowIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-.gi{animation:rowIn .34s ease both}
+#area.fresh .gi{animation:rowIn .34s ease both}
 .tb,.ico,.vb,.ra,.nav-i,.crumb,.tb-btn{transition:transform .12s ease,background .16s ease,color .16s ease,border-color .16s ease,box-shadow .16s ease}
 .tb:active,.ico:active,.vb:active{transform:scale(.94)}
 .tb:hover{transform:translateY(-1px)}
@@ -1374,6 +1619,20 @@ const TXT=new Set(['txt','md','markdown','py','js','mjs','ts','tsx','jsx','css',
 const HTMLX=new Set(['html','htm']);
 
 let stack=[{id:'root',name:'My Drive'}], items=[], sel={}, ctxItem=null, pvItem=null, renTarget=null;
+let curFolder=null, shown=[], animateNext=true, _recT=null, _freshT=null;
+// Ids deleted locally but possibly still present in Graph's (eventually consistent) listing.
+// id -> expiry: they are only needed until Graph catches up, and must not outlive that —
+// an upload with conflictBehavior:replace can reuse a just-deleted item's id, and a
+// permanent tombstone would hide the new file.
+const TOMBS=new Map();
+const TOMB_TTL=45000;
+function tombstone(id){ TOMBS.set(id,Date.now()+TOMB_TTL); }
+function tombed(id){
+  const t=TOMBS.get(id);
+  if(t===undefined) return false;
+  if(Date.now()>t){ TOMBS.delete(id); return false; }
+  return true;
+}
 let sort={col:'name',asc:true}, view='list', filter='';
 const ext=n=>(n||'').split('.').pop().toLowerCase();
 const $=id=>document.getElementById(id);
@@ -1402,19 +1661,24 @@ async function enterApp(email){
   $('auth').style.display='none'; $('app').classList.add('show');
   if(email){ $('who').textContent=email; }
   // turbo default from server (TURBO_UPLOAD env), overridable per-browser
-  try{ const cfg=await fetch('/config').then(r=>r.json()); TURBO=(localStorage.getItem('od_turbo')??(cfg.turbo?'1':'0'))==='1'; }catch(e){}
+  try{ const cfg=await fetch('/config').then(r=>r.json()); TURBO=(localStorage.getItem('od_turbo')??(cfg.turbo?'1':'0'))==='1'; if(cfg.small_max)SMALL_MAX=cfg.small_max; }catch(e){}
   $('turboBtn').classList.toggle('pri',TURBO);
   loadAccounts(); loadStorage(); load('root');
 }
-async function signOut(){ await fetch('/api/logout',{method:'POST'}); location.href='/'; }
+async function signOut(){ await fetch('/api/logout',{method:'POST'}); location.href=BASE+'/'; }
 
 /* ── Accounts (multi-account switcher) ── */
 const CB={ e:b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_'),
   d:s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0));}, rand:n=>crypto.getRandomValues(new Uint8Array(n)) };
+// crypto.subtle is absent in an insecure context (plain http behind a proxy); say so
+// instead of throwing a bare TypeError from deep inside the add-account flow.
 async function aesEnc(pass,saltB64,iters,text){
-  const k0=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
-  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:CB.d(saltB64),iterations:iters,hash:'SHA-256'},k0,{name:'AES-GCM',length:256},false,['encrypt']);
-  const iv=CB.rand(12); const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(text));
+  const sub=window.crypto&&window.crypto.subtle;
+  if(!sub) throw new Error('Adding a secure-mode account needs Web Crypto, which browsers only '
+    +'expose over HTTPS (or on localhost). Serve this over HTTPS and try again.');
+  const k0=await sub.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  const key=await sub.deriveKey({name:'PBKDF2',salt:CB.d(saltB64),iterations:iters,hash:'SHA-256'},k0,{name:'AES-GCM',length:256},false,['encrypt']);
+  const iv=CB.rand(12); const ct=await sub.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(text));
   return {iv:CB.e(iv),ct:CB.e(ct)};
 }
 let ACCTS=[];
@@ -1494,15 +1758,35 @@ async function loadStorage(){
     $('stSub').textContent=fmtSize(d.used)+' of '+fmtSize(d.total);
     if(p>90)$('stFill').style.background='linear-gradient(90deg,var(--danger),#ff8c5c)'; }
 }
-async function load(id){
-  sel={}; $('all').checked=false; setStatus('<span class="spin"></span> Loading…',true);
-  const res=await fetch('/ls?id='+encodeURIComponent(id));
-  if(res.status===401||res.status===403){ location.href='/'; return; }   // session/lock lost -> back to gate
-  const d=await res.json();
-  if(d.error){ setStatus('Error: '+d.error); return; }
-  items=d.items; render(); crumbs(); setStatus(items.length+' items'); selStatus();
+async function load(id,opts){
+  const quiet=opts&&opts.quiet;                 // background reconcile: no spinner, no reset
+  const same=(id===curFolder);
+  if(!quiet){
+    if(!same){ sel={}; TOMBS.clear(); }         // a different folder: selection no longer applies
+    $('all').checked=false; $('all').indeterminate=false;
+    setStatus('<span class="spin"></span> Loading…',true);
+  }
+  let res;
+  try{ res=await fetch('/ls?id='+encodeURIComponent(id)); }
+  catch(e){ if(!quiet)setStatus('Offline — could not list this folder'); return false; }
+  if(res.status===401||res.status===403){ location.href=BASE+'/'; return false; }   // session/lock lost -> back to gate
+  let d; try{ d=await res.json(); }catch(e){ if(!quiet)setStatus('Error: bad response from server'); return false; }
+  if(d.error){ if(!quiet)setStatus('Error: '+d.error); return false; }
+  curFolder=id;
+  // Graph listings are eventually consistent: an item deleted a moment ago can still come
+  // back in the very next listing. Honour local tombstones so a delete never "un-deletes"
+  // itself on refresh, which is what made the UI look like it never refreshed at all.
+  items=(d.items||[]).filter(i=>!tombed(i.id));
+  for(const id2 of Object.keys(sel)) if(!items.some(i=>i.id===id2)) delete sel[id2];
+  animateNext = !same && !quiet;
+  render(); crumbs();
+  if(!quiet)setStatus(items.length+' items');
+  syncAllBox(); selStatus();
+  return true;
 }
 function drill(id,name){ stack.push({id,name}); load(id); }
+// Silent re-list used after a write, so the view catches up without a visible reload.
+function reconcile(delay){ clearTimeout(_recT); _recT=setTimeout(()=>load(stack[stack.length-1].id,{quiet:true}),delay||600); }
 function goRoot(){ stack=[{id:'root',name:'My Drive'}]; load('root'); }
 function up(){ if(stack.length>1)stack.pop(); load(stack[stack.length-1].id); }
 function refresh(){ load(stack[stack.length-1].id); }
@@ -1524,14 +1808,24 @@ function render(){
     if(c==='size'){va=a.size||0;vb=b.size||0;} else if(c==='date'){va=a.modified||'';vb=b.modified||'';}
     else if(c==='type'){va=ext(a.name);vb=ext(b.name);} else {va=a.name.toLowerCase();vb=b.name.toLowerCase();}
     return sort.asc?(va>vb?1:va<vb?-1:0):(va<vb?1:va>vb?-1:0); });
+  shown=list;
   $('empty').style.display=list.length?'none':'flex';
   $('tbl').style.display=view==='list'?'':'none'; $('grid').style.display=view==='grid'?'grid':'none';
-  view==='list'?renderList(list):renderGrid(list);
+  // 'fresh' gates the row entry animation; without it every render replayed it for the
+  // whole list, which read as a full page reload. It is dropped again once the animation
+  // has run, so nothing can retrigger it later.
+  const area=$('area'); area.classList.toggle('fresh',!!animateNext);
+  clearTimeout(_freshT);
+  if(animateNext) _freshT=setTimeout(()=>area.classList.remove('fresh'),420);
+  animateNext=false;
+  if(view==='list'){ $('grid').innerHTML=''; renderList(list); }
+  else { $('tbody').innerHTML=''; renderGrid(list); }
 }
 function renderList(list){
   const tb=$('tbody'); tb.innerHTML='';
   for(const it of list){
     const f=it.folder, e=ext(it.name), tr=document.createElement('tr');
+    tr.dataset.id=it.id;
     if(sel[it.id])tr.classList.add('sel');
     tr.innerHTML=`
       <td class="c-chk"><input type="checkbox" ${sel[it.id]?'checked':''} onchange="toggle(this,'${it.id}')" onclick="event.stopPropagation()"></td>
@@ -1555,10 +1849,10 @@ function renderList(list){
 function renderGrid(list){
   const g=$('grid'); g.innerHTML='';
   for(const it of list){
-    const d=document.createElement('div'); d.className='gi'+(sel[it.id]?' sel':'');
+    const d=document.createElement('div'); d.className='gi'+(sel[it.id]?' sel':''); d.dataset.id=it.id;
     const e=ext(it.name), thumbable=IMG.has(e)||VID.has(e)||e==='pdf';
     const visual = thumbable
-      ? `<img class="gthumb" src="/thumb?id=${encodeURIComponent(it.id)}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display=''"><i class="${faicon(it)} fi ${cls(it)}" style="display:none"></i>`
+      ? `<img class="gthumb" src="${BASE}/thumb?id=${encodeURIComponent(it.id)}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display=''"><i class="${faicon(it)} fi ${cls(it)}" style="display:none"></i>`
       : `<i class="${faicon(it)} fi ${cls(it)}"></i>`;
     d.innerHTML=`<input type="checkbox" class="gchk" ${sel[it.id]?'checked':''} onchange="toggle(this,'${it.id}')" onclick="event.stopPropagation()">
       ${visual}
@@ -1581,9 +1875,38 @@ function cls(it){ if(it.folder)return 'folder'; const e=ext(it.name);
   if(e==='pdf')return 'pdf'; if(['doc','docx','ppt','pptx'].includes(e))return 'doc'; if(['xls','xlsx'].includes(e))return 'sheet';
   if(TXT.has(e))return 'code'; if(['zip','rar','7z','tar','gz'].includes(e))return 'archive'; return 'def'; }
 
-/* ── Selection ── */
-function toggle(cb,id){ cb.checked?sel[id]=items.find(i=>i.id===id):delete sel[id]; render(); selStatus(); }
-function selAll(m){ if(m.checked)items.forEach(i=>sel[i.id]=i); else sel={}; render(); selStatus(); }
+/* ── Selection ──
+   These used to call render(), which threw away every row (and every grid thumbnail) and
+   rebuilt the list from scratch just to move one highlight — the whole list flashed and
+   re-fetched its images, and the CSS transition never had two states to animate between.
+   Now only the affected row is touched, so the highlight eases in where it is. */
+// Scoped to the *active* view: the inactive container still holds its last-rendered nodes,
+// and a hidden <tr> with the same data-id would otherwise shadow the visible grid tile.
+function viewRoot(){ return view==='grid'?$('grid'):$('tbody'); }
+function rowEl(id){ return viewRoot().querySelector('[data-id="'+(window.CSS&&CSS.escape?CSS.escape(id):id)+'"]'); }
+function markSel(id,on){
+  const el=rowEl(id); if(!el)return;
+  el.classList.toggle('sel',on);
+  const cb=el.querySelector('input[type=checkbox]'); if(cb)cb.checked=on;
+}
+function syncAllBox(){
+  const box=$('all'); if(!box)return;
+  const n=shown.filter(i=>sel[i.id]).length;
+  box.checked=n>0&&n===shown.length;
+  box.indeterminate=n>0&&n<shown.length;      // partial selection now reads as partial
+}
+function toggle(cb,id){
+  const on=cb.checked;
+  if(on){ const it=items.find(i=>i.id===id); if(it)sel[id]=it; } else delete sel[id];
+  markSel(id,on); syncAllBox(); selStatus();
+}
+function selAll(m){
+  const on=m.checked;
+  sel={};
+  if(on) for(const i of shown) sel[i.id]=i;   // only what's actually visible under the filter
+  for(const i of shown) markSel(i.id,on);
+  m.indeterminate=false; selStatus();
+}
 function selStatus(){ const n=Object.keys(sel).length; $('stSel').textContent=n?n+' selected':''; }
 
 /* ── Download: 302 straight to Microsoft CDN (raw stream, no host buffering) ── */
@@ -1745,14 +2068,34 @@ function audioPlayer(body,src,it){
 
 /* ── Upload: browser -> Microsoft direct, proxy fallback ── */
 // OneDrive resumable sessions REJECT parallel/out-of-order fragments (tested: 63/64 fail),
-// so multi-stream S3-style upload is impossible. Direct browser->MS is HTTP/2 flow-limited
-// (~13 MB/s); 10 MiB is the sweet spot. Turbo streams through the host (~44 MB/s, HTTP/1.1)
-// at the cost of server egress. XHR gives smooth sub-chunk progress (no more 6s dead start).
+// so multi-stream S3-style upload is impossible *within one file*. Direct browser->MS is
+// HTTP/2 flow-limited (~13 MB/s); 10 MiB is the sweet spot. Turbo streams through the host
+// at the cost of server egress. XHR gives smooth sub-chunk progress.
+//
+// Bulk uploads used to fail hard at ~20 files: Graph throttles a burst of
+// createUploadSession calls with 429, and a single 429 silently skipped that file — while
+// the session it had already opened left a 0-byte placeholder behind in the folder. Three
+// things fix it: small files skip sessions entirely (one PUT each), every request retries
+// with backoff on 429/5xx, and a file we do give up on has its session cancelled so no
+// 0-byte stub survives.
 let TURBO=false;
-const CHUNK_DIRECT=10*1024*1024;   // 10 MiB (=32×320KiB)
-const CHUNK_TURBO =20*1024*1024;   // 20 MiB
+let SMALL_MAX=8*1024*1024;         // server-provided; files at/below this go in one PUT
+const CHUNK_DIRECT=10*1024*1024;   // 10 MiB (=32x320KiB)
+const CHUNK_TURBO = 8*1024*1024;   // 8 MiB: the host streams it through, so a big buffer
+                                   // buys nothing and only stalls progress + host memory
+const SMALL_PARALLEL=3;            // small files ride concurrently; large ones go one at a time
+const MAX_TRIES=5;
 
 function toggleTurbo(){ TURBO=!TURBO; localStorage.setItem('od_turbo',TURBO?'1':'0'); $('turboBtn').classList.toggle('pri',TURBO); }
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// Honour Graph's own Retry-After when it sends one, else exponential backoff with jitter.
+function backoff(try_, hdr){
+  const n=parseFloat(hdr);
+  if(isFinite(n)&&n>0) return Math.min(n*1000,20000);
+  return Math.min(500*Math.pow(2,try_),8000)+Math.random()*250;
+}
+const RETRYABLE=st=>st===0||st===429||(st>=500&&st<600);
 
 function putChunk(url, blob, range, proxy, onprog){
   return new Promise(resolve=>{
@@ -1760,51 +2103,235 @@ function putChunk(url, blob, range, proxy, onprog){
     xhr.open('PUT', proxy ? '/upload/proxy?url='+encodeURIComponent(url) : url);
     xhr.setRequestHeader('Content-Range', range);
     xhr.upload.onprogress=e=>{ if(e.lengthComputable&&onprog) onprog(e.loaded); };
-    xhr.onload=()=>resolve(xhr.status);
-    xhr.onerror=()=>resolve(0);
+    xhr.onload=()=>resolve({status:xhr.status,retryAfter:xhr.getResponseHeader('Retry-After')});
+    xhr.onerror=()=>resolve({status:0,retryAfter:null});
+    xhr.ontimeout=()=>resolve({status:0,retryAfter:null});
     xhr.send(blob);
   });
 }
+
+/* ── progress toast: per-batch, so 25 files read as one job ── */
+const UP={total:0,done:0,failed:0,label:'',bytes:0,sent:0,t0:0};
+function upUI(){
+  const pct=UP.bytes?Math.min(100,UP.sent/UP.bytes*100):0;
+  $('utFill').style.width=pct.toFixed(1)+'%';
+  $('utCount').textContent=(UP.done+UP.failed)+' / '+UP.total;
+  $('utName').textContent=UP.label||'Uploading…';
+  const sec=(Date.now()-UP.t0)/1000||0.001, rate=UP.sent/1048576/sec;
+  const eta=rate>0?(UP.bytes-UP.sent)/(rate*1048576):0;
+  $('utRate').textContent=rate.toFixed(1)+' MB/s '+(TURBO?'⚡ turbo':'· direct')
+    +(UP.sent<UP.bytes?'  ·  '+fmtT(eta)+' left':'')
+    +(UP.failed?'  ·  '+UP.failed+' failed':'');
+}
+
 async function upload(files){
   if(!files||!files.length)return;
+  // Snapshot the FileList: it belongs to the <input>/DataTransfer and can be invalidated
+  // out from under a long-running loop.
+  const list=Array.from(files);
   const parent=stack[stack.length-1].id;
-  $('utoast').style.display='block'; $('utName').textContent='Preparing…'; $('utFill').style.width='0%'; $('utRate').textContent='';
-  for(let i=0;i<files.length;i++){ await uploadOne(files[i],parent,i+1,files.length); }
-  $('utoast').style.display='none'; refresh(); loadStorage();
+  UP.total=list.length; UP.done=0; UP.failed=0; UP.label='Preparing…';
+  UP.bytes=list.reduce((a,f)=>a+f.size,0); UP.sent=0; UP.t0=Date.now();
+  $('utoast').style.display='block'; $('utFill').style.width='0%'; upUI();
+
+  const small=list.filter(f=>f.size<=SMALL_MAX), big=list.filter(f=>f.size>SMALL_MAX);
+  const failures=[];
+  const run=async f=>{
+    const r=await uploadOne(f,parent);
+    if(r.ok){ UP.done++; if(r.item)addLocal(r.item); } else { UP.failed++; failures.push(f.name+' — '+r.error); }
+    upUI();
+  };
+  // Small files: a few at a time. Large files: strictly one at a time so they don't fight
+  // over the same uplink.
+  const queue=small.slice();
+  await Promise.all(Array.from({length:Math.min(SMALL_PARALLEL,queue.length)},async()=>{
+    while(queue.length) await run(queue.shift());
+  }));
+  for(const f of big) await run(f);
+
+  $('utoast').style.display='none';
+  if(failures.length){
+    toast(failures.length+' of '+UP.total+' upload'+(UP.total>1?'s':'')+' failed','fa-triangle-exclamation');
+    console.warn('[upload] failures:\n'+failures.join('\n'));
+  } else toast(UP.total+' file'+(UP.total>1?'s':'')+' uploaded','fa-cloud-arrow-up');
+  loadStorage(); reconcile(300);
 }
-async function uploadOne(file,parent,idx,total){
-  $('utName').textContent=file.name; $('utCount').textContent=idx+' / '+total;
-  $('utFill').style.width='0%'; $('utRate').textContent='preparing…';
-  const s=await fetch('/upload/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:parent,name:file.name})}).then(r=>r.json());
-  if(!s.ok){ toast('Upload failed: session error'); return; }
-  const url=s.uploadUrl, size=file.size;
-  let useProxy=TURBO, CHUNK=useProxy?CHUNK_TURBO:CHUNK_DIRECT, offset=0, t0=Date.now();
-  while(offset<size){
-    const end=Math.min(offset+CHUNK,size), blob=file.slice(offset,end), base=offset;
-    const range=`bytes ${offset}-${end-1}/${size}`;
-    const prog=loaded=>{ const cur=base+loaded, sec=(Date.now()-t0)/1000||0.001;
-      $('utFill').style.width=(cur/size*100)+'%';
-      const eta=(size-cur)/((cur/sec)||1);
-      $('utRate').textContent=(cur/1048576/sec).toFixed(1)+' MB/s '+(useProxy?'⚡ turbo':'· direct')+(cur<size?'  ·  '+fmtT(eta)+' left':''); };
-    let st=await putChunk(url,blob,range,useProxy,prog);
-    if(![200,201,202].includes(st) && !useProxy){ useProxy=true; st=await putChunk(url,blob,range,true,prog); } // direct blocked -> proxy
-    if(![200,201,202].includes(st)){ toast('Upload failed at '+fmtSize(offset)+' (HTTP '+st+')'); return; }
-    offset=end; $('utFill').style.width=(offset/size*100)+'%';
+
+async function uploadOne(file,parent){
+  UP.label=file.name; upUI();
+  return file.size<=SMALL_MAX ? uploadSmall(file,parent) : uploadResumable(file,parent);
+}
+
+// One request per file. This is what keeps a 25-file drop from tripping the
+// createUploadSession burst limit at all.
+async function uploadSmall(file,parent){
+  const q='/upload/small?parent_id='+encodeURIComponent(parent)+'&name='+encodeURIComponent(file.name);
+  for(let t=0;t<MAX_TRIES;t++){
+    let last=0;
+    const res=await putChunkSmall(q,file,loaded=>{ UP.sent+=loaded-last; last=loaded; upUI(); });
+    if(res.status>=200&&res.status<300){
+      UP.sent+=file.size-last; upUI();
+      let body={}; try{ body=JSON.parse(res.text||'{}'); }catch(e){}
+      return {ok:true,item:body.id?{id:body.id,name:body.name||file.name,folder:false,
+              size:body.size!=null?body.size:file.size,modified:new Date().toISOString()}:null};
+    }
+    UP.sent-=last;                       // don't double-count a failed attempt
+    if(!RETRYABLE(res.status)&&res.status!==413) return {ok:false,error:'HTTP '+res.status};
+    if(res.status===413) return uploadResumable(file,parent);   // server says use a session
+    if(t===MAX_TRIES-1) return {ok:false,error:'HTTP '+res.status+' after '+MAX_TRIES+' tries'};
+    await sleep(backoff(t,res.retryAfter));
   }
-  const sec=(Date.now()-t0)/1000||1; $('utRate').textContent='done · '+(size/1048576/sec).toFixed(1)+' MB/s avg';
+  return {ok:false,error:'exhausted retries'};
+}
+function putChunkSmall(url,blob,onprog){
+  return new Promise(resolve=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open('PUT',url);
+    xhr.setRequestHeader('Content-Type',blob.type||'application/octet-stream');
+    xhr.upload.onprogress=e=>{ if(e.lengthComputable&&onprog)onprog(e.loaded); };
+    xhr.onload=()=>resolve({status:xhr.status,text:xhr.responseText,retryAfter:xhr.getResponseHeader('Retry-After')});
+    xhr.onerror=()=>resolve({status:0,text:'',retryAfter:null});
+    xhr.send(blob);
+  });
+}
+
+async function uploadResumable(file,parent){
+  // createUploadSession, with backoff — a 429 here used to drop the file silently.
+  let url=null;
+  for(let t=0;t<MAX_TRIES;t++){
+    let r,st=0;
+    try{
+      r=await fetch('/upload/session',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({parent_id:parent,name:file.name})});
+      st=r.status;
+      const body=await r.json().catch(()=>({}));
+      if(body&&body.ok&&body.uploadUrl){ url=body.uploadUrl; break; }
+      if(!RETRYABLE(st)) return {ok:false,error:'session: HTTP '+st};
+      if(t===MAX_TRIES-1) return {ok:false,error:'session: HTTP '+st+' after '+MAX_TRIES+' tries'};
+      await sleep(backoff(t,r.headers.get('Retry-After')));
+    }catch(e){
+      if(t===MAX_TRIES-1) return {ok:false,error:'session: '+((e&&e.message)||'network')};
+      await sleep(backoff(t,null));
+    }
+  }
+  if(!url) return {ok:false,error:'no upload session'};
+
+  const size=file.size;
+  let useProxy=TURBO, CHUNK=useProxy?CHUNK_TURBO:CHUNK_DIRECT, offset=0, item=null;
+  while(offset<size){
+    const end=Math.min(offset+CHUNK,size), blob=file.slice(offset,end);
+    const range='bytes '+offset+'-'+(end-1)+'/'+size;
+    let done=false;
+    for(let t=0;t<MAX_TRIES;t++){
+      let last=0;
+      const res=await putChunk(url,blob,range,useProxy,loaded=>{ UP.sent+=loaded-last; last=loaded; upUI(); });
+      if([200,201,202].includes(res.status)){
+        UP.sent+=(end-offset)-last; upUI(); done=true;
+        if(res.status!==202) item={id:null};      // committed
+        break;
+      }
+      UP.sent-=last; upUI();
+      // A direct browser->Microsoft PUT blocked by CORS reports status 0; fall back to the
+      // host proxy once before treating it as a real failure.
+      if(res.status===0&&!useProxy){ useProxy=true; CHUNK=CHUNK_TURBO; continue; }
+      if(!RETRYABLE(res.status)) break;
+      if(t===MAX_TRIES-1) break;
+      await sleep(backoff(t,res.retryAfter));
+    }
+    if(!done){
+      // Give up on this file — and cancel the session, otherwise personal OneDrive keeps
+      // the reserved name as a 0-byte file in the folder.
+      await fetch('/upload/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url})}).catch(()=>{});
+      return {ok:false,error:'stalled at '+fmtSize(offset)};
+    }
+    offset=end;
+  }
+  return {ok:true,item:null};
 }
 function fmtT(s){ if(!isFinite(s)||s<0)return '—'; s=Math.round(s); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
 
-/* ── Folder / new file / rename / delete ── */
-async function mkdir(){ const n=prompt('Folder name:'); if(!n)return; await fetch('/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:stack[stack.length-1].id,name:n})}); refresh(); }
-async function newTextFile(){ const n=prompt('File name (e.g. notes.txt):'); if(!n)return; await fetch('/newfile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:stack[stack.length-1].id,name:n,content:''})}); refresh(); }
+/* ── Folder / new file / rename / delete ──
+   Every mutation here is applied to the local list first and reconciled with Graph in the
+   background. Graph is eventually consistent, so the old "fire the write, then immediately
+   re-list" approach frequently listed the *pre-write* state — the change appeared not to
+   happen at all until you navigated away and back. */
+function removeLocal(ids){
+  for(const id of ids){
+    tombstone(id); delete sel[id];
+    const el=rowEl(id);
+    if(el){ el.classList.add('gone'); setTimeout(()=>el.remove(),170); }
+  }
+  items=items.filter(i=>!ids.includes(i.id));
+  shown=shown.filter(i=>!ids.includes(i.id));
+  setStatus(items.length+' items'); syncAllBox(); selStatus();
+}
+function restoreLocal(entries){
+  for(const it of entries){ if(it){ TOMBS.delete(it.id); items.push(it); } }
+  animateNext=false; render(); syncAllBox(); selStatus();
+}
+function addLocal(it){
+  if(!it||items.some(i=>i.id===it.id))return;
+  TOMBS.delete(it.id); items.push(it); animateNext=false; render();
+  setStatus(items.length+' items');
+}
+async function mkdir(){
+  const n=prompt('Folder name:'); if(!n)return;
+  const r=await fetch('/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:stack[stack.length-1].id,name:n})}).then(r=>r.json()).catch(()=>({}));
+  if(r&&r.id) addLocal({id:r.id,name:r.name||n,folder:true,size:0,modified:new Date().toISOString()});
+  else toast('Could not create folder','fa-triangle-exclamation');
+  reconcile();
+}
+async function newTextFile(){
+  const n=prompt('File name (e.g. notes.txt):'); if(!n)return;
+  const r=await fetch('/newfile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_id:stack[stack.length-1].id,name:n,content:''})}).then(r=>r.json()).catch(()=>({}));
+  if(r&&r.ok) addLocal({id:r.id||('tmp-'+n),name:n,folder:false,size:0,modified:new Date().toISOString()});
+  else toast('Could not create file','fa-triangle-exclamation');
+  reconcile();
+}
 function openRename(it){ renTarget=it; $('renInput').value=it.name; $('renM').classList.add('open'); setTimeout(()=>{$('renInput').focus();$('renInput').select();},40); }
 function renameSel(){ const ids=Object.keys(sel); if(ids.length!==1)return toast('Select exactly one item'); openRename(sel[ids[0]]); }
-async function doRename(){ if(!renTarget)return; const n=$('renInput').value.trim(); if(!n||n===renTarget.name){closeMask('renM');return;} await fetch('/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:renTarget.id,name:n})}); closeMask('renM'); refresh(); }
+async function doRename(){
+  if(!renTarget)return;
+  const n=$('renInput').value.trim(); if(!n||n===renTarget.name){closeMask('renM');return;}
+  const target=renTarget, was=target.name;
+  closeMask('renM');
+  const it=items.find(i=>i.id===target.id);
+  if(it){ it.name=n; animateNext=false; render(); }        // instant
+  const r=await fetch('/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:target.id,name:n})}).then(r=>r.json()).catch(()=>({}));
+  if(!(r&&r.ok)){ if(it){ it.name=was; animateNext=false; render(); } toast('Rename failed','fa-triangle-exclamation'); }
+  reconcile();
+}
 function closeMask(id){ $(id).classList.remove('open'); }
 $('renInput').addEventListener('keydown',e=>{ if(e.key==='Enter')doRename(); if(e.key==='Escape')closeMask('renM'); });
-async function delOne(id){ if(!confirm('Delete this item? This cannot be undone.'))return; await fetch('/delete?id='+encodeURIComponent(id),{method:'DELETE'}); refresh(); loadStorage(); }
-async function delSelected(){ const ids=Object.keys(sel); if(!ids.length)return toast('Select files first'); if(!confirm(`Delete ${ids.length} item(s)?`))return; setStatus('<span class="spin"></span> Deleting…',true); for(const id of ids)await fetch('/delete?id='+encodeURIComponent(id),{method:'DELETE'}); sel={}; refresh(); loadStorage(); }
+async function delOne(id){
+  if(!confirm('Delete this item? This cannot be undone.'))return;
+  const it=items.find(i=>i.id===id);
+  removeLocal([id]);                                        // gone from the UI immediately
+  const r=await fetch('/delete?id='+encodeURIComponent(id),{method:'DELETE'}).then(r=>r.json()).catch(()=>({}));
+  if(!(r&&r.ok)){ restoreLocal([it]); toast('Delete failed','fa-triangle-exclamation'); }
+  else toast('Deleted','fa-trash');
+  loadStorage(); reconcile();
+}
+async function delSelected(){
+  const ids=Object.keys(sel); if(!ids.length)return toast('Select files first');
+  if(!confirm(`Delete ${ids.length} item(s)?`))return;
+  const backup=ids.map(id=>items.find(i=>i.id===id)).filter(Boolean);
+  removeLocal(ids);
+  // One batched call instead of N sequential round-trips: deleting 20 items was 20
+  // browser<->Graph waits back to back.
+  let r;
+  try{
+    r=await fetch('/delete/batch',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ids})}).then(r=>r.json());
+  }catch(e){ r={ok:false,failed:ids}; }
+  const failed=(r&&r.failed)||[];
+  if(failed.length){
+    restoreLocal(backup.filter(i=>failed.includes(i.id)));
+    toast(failed.length+' of '+ids.length+' could not be deleted','fa-triangle-exclamation');
+  } else toast(ids.length+' deleted','fa-trash');
+  loadStorage(); reconcile();
+}
 
 /* ── Context menu ── */
 function showCtx(e,it){ ctxItem=it; sel={[it.id]:it}; render(); selStatus(); const m=$('ctx'); m.style.display='block';
@@ -1817,7 +2344,7 @@ function ctxCopy(){ if(ctxItem)navigator.clipboard.writeText(ctxItem.name); hide
 function ctxRaw(){ if(ctxItem&&!ctxItem.folder)copyRaw(ctxItem.id); hideCtx(); }
 // Raw inline link -> /view: a tiny shell that streams bytes browser<->CDN direct (ZERO host egress),
 // renders inline instead of downloading, and never expires (re-signs each load).
-function copyRaw(id){ if(!id)return; const u=location.origin+'/view?id='+encodeURIComponent(id);
+function copyRaw(id){ if(!id)return; const u=location.origin+BASE+'/view?id='+encodeURIComponent(id);
   navigator.clipboard.writeText(u).then(()=>toast('Raw link copied — opens inline, zero server bandwidth, never expires')).catch(()=>toast(u)); }
 function ctxDel(){ if(ctxItem)delOne(ctxItem.id); hideCtx(); }
 document.addEventListener('click',hideCtx);
@@ -1843,7 +2370,7 @@ openRename=o=>{ if(typeof o==='string')o=JSON.parse(o.replace(/&#39;/g,"'").repl
 
 /* boot */
 // Served only when configured + logged in + unlocked — go straight in.
-(async()=>{ let email=''; try{ const s=await fetch('/status').then(r=>r.json()); if(s&&s.token_ready===false){ location.href='/'; return; } email=s&&s.email; }catch(e){} enterApp(email); })();
+(async()=>{ let email=''; try{ const s=await fetch('/status').then(r=>r.json()); if(s&&s.token_ready===false){ location.href=BASE+'/'; return; } email=s&&s.email; }catch(e){} enterApp(email); })();
 </script>
 </body>
 </html>"""
@@ -1856,6 +2383,24 @@ GATE_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nimbus · Setup</title>
+<script>
+/* ── Reverse-proxy base path ──────────────────────────────────────────────────
+   Mounted under a prefix (https://host/od) every root-relative request escaped the
+   prefix and 404'd — including the very first /api/state, which left the gate with no
+   panel shown at all (a blank card). Resolve the prefix once, then rebase fetch + XHR so
+   every call site stays correct without having to know about it. */
+window.__BASE__ = {{ base|tojson }};
+const BASE = (window.__BASE__ || location.pathname.replace(/\/+$/, '') || '');
+const U = p => (typeof p === 'string' && p[0] === '/' ? BASE + p : p);
+if (BASE) {
+  const _fetch = window.fetch;
+  window.fetch = (u, o) => _fetch(U(u), o);
+  const _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+    return _open.call(this, m, U(u), ...rest);
+  };
+}
+</script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{--accent:#7c6cff;--accent2:#a45cff;--ok:#3ee08f;--warn:#ffcf5c;--danger:#ff5c7a;
@@ -1989,6 +2534,16 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,108,255,.25
     <div class="filehint" id="code-hint"></div>
     <button class="btn" id="code-done" onclick="location.reload()"><i class="fa-solid fa-rotate-right"></i> I've committed & redeployed — continue</button>
   </div>
+
+  <!-- Shown when boot itself fails. Without this a failed /api/state left every panel
+       hidden, i.e. a blank card with no way to tell what went wrong. -->
+  <div class="panel" id="p-boot-err">
+    <div class="step">Can't start</div>
+    <h2>Something blocked the setup screen</h2>
+    <p class="sub" id="boot-err-msg"></p>
+    <div class="codebox"><textarea id="boot-err-detail" readonly style="min-height:96px"></textarea></div>
+    <button class="btn" onclick="location.reload()"><i class="fa-solid fa-rotate-right"></i> Retry</button>
+  </div>
 </div>
 <div class="toast" id="toast"><i class="fa-solid fa-check"></i><span id="toast-t"></span></div>
 
@@ -2001,25 +2556,93 @@ const ITERS=210000;
 const B={
   e:b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_'),
   d:s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0));},
-  rand:n=>crypto.getRandomValues(new Uint8Array(n)),
+  rand:n=>{ if(window.crypto&&crypto.getRandomValues) return crypto.getRandomValues(new Uint8Array(n));
+            const a=new Uint8Array(n); for(let i=0;i<n;i++)a[i]=Math.floor(Math.random()*256); return a; },
 };
+/* Web Crypto's subtle API only exists in a SECURE CONTEXT. Served over plain http through a
+   reverse proxy (or on a bare LAN IP) it is undefined, and login died on an unhandled
+   TypeError before any panel rendered. SUBTLE is used when present; the pure-JS
+   SHA-256/PBKDF2 below keeps the password path working when it is not. */
+const SUBTLE = (window.crypto && window.crypto.subtle) || null;
+
+/* ── pure-JS SHA-256 / HMAC / PBKDF2, insecure-context fallback only ── */
+const _K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+function sha256(bytes){
+  const ml=bytes.length, wl=((ml+8>>6)+1)<<4, m=new Uint32Array(wl);
+  for(let i=0;i<ml;i++) m[i>>2]|=bytes[i]<<(24-(i%4)*8);
+  m[ml>>2]|=0x80<<(24-(ml%4)*8); m[wl-1]=ml*8;
+  let H=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const w=new Uint32Array(64), rr=(x,n)=>(x>>>n)|(x<<(32-n));
+  for(let i=0;i<wl;i+=16){
+    for(let t=0;t<16;t++) w[t]=m[i+t];
+    for(let t=16;t<64;t++){ const a=w[t-15],b=w[t-2];
+      w[t]=(((rr(b,17)^rr(b,19)^(b>>>10))+w[t-7])|0)+(((rr(a,7)^rr(a,18)^(a>>>3))+w[t-16])|0)|0; }
+    let [a,b,c,d,e,f,g,h]=H;
+    for(let t=0;t<64;t++){
+      const T1=(h+(rr(e,6)^rr(e,11)^rr(e,25))+((e&f)^(~e&g))+_K[t]+w[t])|0;
+      const T2=((rr(a,2)^rr(a,13)^rr(a,22))+((a&b)^(a&c)^(b&c)))|0;
+      h=g;g=f;f=e;e=(d+T1)|0;d=c;c=b;b=a;a=(T1+T2)|0;
+    }
+    H=[(H[0]+a)|0,(H[1]+b)|0,(H[2]+c)|0,(H[3]+d)|0,(H[4]+e)|0,(H[5]+f)|0,(H[6]+g)|0,(H[7]+h)|0];
+  }
+  const out=new Uint8Array(32);
+  for(let i=0;i<8;i++){ out[i*4]=H[i]>>>24; out[i*4+1]=(H[i]>>>16)&255; out[i*4+2]=(H[i]>>>8)&255; out[i*4+3]=H[i]&255; }
+  return out;
+}
+function hmacSha256(key,msg){
+  if(key.length>64)key=sha256(key);
+  const k=new Uint8Array(64); k.set(key);
+  const op=new Uint8Array(64), ip=new Uint8Array(64);
+  for(let i=0;i<64;i++){ op[i]=k[i]^0x5c; ip[i]=k[i]^0x36; }
+  const inner=new Uint8Array(64+msg.length); inner.set(ip); inner.set(msg,64);
+  const outer=new Uint8Array(96); outer.set(op); outer.set(sha256(inner),64);
+  return sha256(outer);
+}
+function pbkdf2Js(pass,salt,iters,bytes){
+  const pw=new TextEncoder().encode(pass), out=new Uint8Array(bytes);
+  let done=0, block=1;
+  while(done<bytes){
+    const bi=new Uint8Array(salt.length+4); bi.set(salt);
+    bi[salt.length]=block>>>24; bi[salt.length+1]=(block>>>16)&255;
+    bi[salt.length+2]=(block>>>8)&255; bi[salt.length+3]=block&255;
+    let u=hmacSha256(pw,bi); const acc=u.slice();
+    for(let i=1;i<iters;i++){ u=hmacSha256(pw,u); for(let j=0;j<32;j++)acc[j]^=u[j]; }
+    const n=Math.min(32,bytes-done); out.set(acc.subarray(0,n),done);
+    done+=n; block++;
+  }
+  return out;
+}
 async function pbkdf2Bits(pass,salt,iters,bits){
-  const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveBits']);
-  return new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:iters,hash:'SHA-256'},k,bits));
+  if(!SUBTLE) return pbkdf2Js(pass,salt,iters,bits/8);
+  const k=await SUBTLE.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveBits']);
+  return new Uint8Array(await SUBTLE.deriveBits({name:'PBKDF2',salt,iterations:iters,hash:'SHA-256'},k,bits));
+}
+function needSubtle(){
+  if(!SUBTLE) throw new Error('Secure mode needs Web Crypto, which browsers only expose over '
+    +'HTTPS (or on localhost). This page is on '+location.protocol+'//'+location.host
+    +' — serve it over HTTPS, or set this instance up in Basic mode.');
 }
 async function aesKey(pass,salt,iters){
-  const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iters,hash:'SHA-256'},k,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  needSubtle();
+  const k=await SUBTLE.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return SUBTLE.deriveKey({name:'PBKDF2',salt,iterations:iters,hash:'SHA-256'},k,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
 }
 async function phash(pass,saltB64){ return B.e(await pbkdf2Bits(pass,B.d(saltB64),ITERS,256)); }
 async function aesEnc(pass,saltB64,iters,text){
   const key=await aesKey(pass,B.d(saltB64),iters),iv=B.rand(12);
-  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(text));
+  const ct=await SUBTLE.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(text));
   return {iv:B.e(iv),ct:B.e(ct)};
 }
 async function aesDec(pass,saltB64,iters,ivB64,ctB64){
   const key=await aesKey(pass,B.d(saltB64),iters);
-  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:B.d(ivB64)},key,B.d(ctB64));
+  const pt=await SUBTLE.decrypt({name:'AES-GCM',iv:B.d(ivB64)},key,B.d(ctB64));
   return new TextDecoder().decode(pt);
 }
 
@@ -2030,15 +2653,47 @@ function copyText(t){ navigator.clipboard.writeText(t).then(()=>toast('Copied to
 function pickMethod(m){ METHOD=m; $('m-basic').classList.toggle('sel',m==='basic'); $('m-secure').classList.toggle('sel',m==='secure'); }
 
 /* ── Boot: decide panel from server state ── */
+// Every failure here used to reject silently and leave the card empty (the classic
+// "sign-in page doesn't render behind a proxy"): a proxy that answers /api/state with an
+// HTML error page threw a JSON parse error and nothing was ever shown. Now any failure
+// names itself on screen.
+function bootError(msg, detail){
+  $('boot-err-msg').textContent=msg;
+  $('boot-err-detail').value=String(detail||'').slice(0,800);
+  show('p-boot-err');
+}
 (async()=>{
-  STATE=await fetch('/api/state').then(r=>r.json());
-  if(STATE.state==='unconfigured'){ show('p-setup'); }
-  else if(STATE.state==='creds_only'){ STATE.authed?show('p-connect'):(loginFor('connect'),show('p-login')); }
-  else { // ready
-    if(STATE.authed && !STATE.token_ready && STATE.method==='secure'){ show('p-unlock'); }
-    else { loginFor('app'); show('p-login'); }
+  let res;
+  try{
+    res=await fetch('/api/state',{headers:{'Accept':'application/json'}});
+  }catch(e){
+    return bootError('Could not reach the server at '+location.origin+BASE+'. '
+      +'If this instance sits behind a proxy, check that it forwards this path.', e&&e.message);
   }
+  const body=await res.text();
+  try{
+    STATE=JSON.parse(body);
+  }catch(e){
+    return bootError('The server answered '+res.status+' with '+(res.headers.get('content-type')||'no content type')
+      +' instead of JSON for '+BASE+'/api/state. A reverse proxy is most likely rewriting or '
+      +'swallowing the request — mount the app at a path it forwards intact, or set '
+      +'X-Forwarded-Prefix.', body);
+  }
+  try{
+    if(STATE.state==='unconfigured'){ show('p-setup'); }
+    else if(STATE.state==='creds_only'){ STATE.authed?show('p-connect'):(loginFor('connect'),show('p-login')); }
+    else { // ready
+      if(STATE.authed && !STATE.token_ready && STATE.method==='secure'){ show('p-unlock'); }
+      else { loginFor('app'); show('p-login'); }
+    }
+  }catch(e){ bootError('The setup screen failed to initialise.', (e&&e.stack)||e); }
+  if(!SUBTLE) toast('Running without HTTPS — Secure mode is unavailable here');
 })();
+// A late error must not leave a half-drawn card with no explanation either.
+window.addEventListener('unhandledrejection',e=>{
+  if(!document.querySelector('.panel.on')) bootError('The setup screen failed to load.',
+    (e.reason&&(e.reason.stack||e.reason.message))||e.reason);
+});
 function loginFor(next){ window._next=next; $('l-user').value=STATE.user||''; }
 
 /* ── Setup ── */
@@ -2048,9 +2703,16 @@ async function doSetup(){
   if(p.length<6) return $('s-err').textContent='Password must be at least 6 characters.';
   if(p!==p2) return $('s-err').textContent='Passwords do not match.';
   $('s-err').textContent=''; const btn=$('s-btn'); btn.disabled=true; btn.innerHTML='<span class="spin"></span> Generating…';
-  const salt=B.e(B.rand(16)); const body={method:METHOD,user:u,salt,iters:ITERS,phash:await phash(p,salt)};
-  if(METHOD==='secure') body.enc_salt=B.e(B.rand(16));
-  const r=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+  let r;
+  try{
+    if(METHOD==='secure') needSubtle();
+    const salt=B.e(B.rand(16)); const body={method:METHOD,user:u,salt,iters:ITERS,phash:await phash(p,salt)};
+    if(METHOD==='secure') body.enc_salt=B.e(B.rand(16));
+    r=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+  }catch(e){
+    btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-wand-magic-sparkles"></i> Generate credentials code';
+    return $('s-err').textContent=(e&&e.message)||'Setup failed.';
+  }
   btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-wand-magic-sparkles"></i> Generate credentials code';
   if(!r.ok) return $('s-err').textContent=r.error||'Setup failed.';
   PASS=p;
@@ -2061,15 +2723,21 @@ async function doSetup(){
 async function doLogin(){
   const u=$('l-user').value.trim(),p=$('l-pass').value;
   $('l-err').textContent=''; const btn=$('l-btn'); btn.disabled=true; btn.querySelector('span').textContent='Checking…';
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,pass:p})}).then(r=>r.json());
+  let r;
+  try{
+    r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,pass:p})}).then(r=>r.json());
+  }catch(e){
+    btn.disabled=false; btn.querySelector('span').textContent='Log in';
+    return $('l-err').textContent='Could not reach the server: '+((e&&e.message)||'network error');
+  }
   btn.disabled=false; btn.querySelector('span').textContent='Log in';
   if(!r.ok){ $('l-err').textContent=r.error||'Login failed'; return; }
   PASS=p;
   if(r.state==='creds_only'){ show('p-connect'); return; }
   // ready:
-  if(r.token_ready){ location.href='/'; return; }
+  if(r.token_ready){ location.href=BASE+'/'; return; }
   if(r.method==='secure' && r.token_enc){ await unlockWith(p, r.token_enc); }
-  else { location.href='/'; }
+  else { location.href=BASE+'/'; }
 }
 
 /* ── Unlock (secure) ── */
@@ -2084,7 +2752,7 @@ async function unlockWith(pass, enc){
   for(const a of (enc.accounts||[])){ rts[a.id]=await aesDec(pass, enc.enc_salt, enc.iters, a.iv, a.ct); } // throws on wrong pw
   const r=await fetch('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rts})}).then(r=>r.json());
   if(!r.ok) throw new Error('unlock failed');
-  location.href='/';
+  location.href=BASE+'/';
 }
 
 /* ── Connect (device code) ── */

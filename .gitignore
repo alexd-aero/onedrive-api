@@ -11,3 +11,7 @@ venv/
 # runtime
 cloudflared.log
 *.log
+
+# test harness
+tests/node_modules/
+tests/_state/

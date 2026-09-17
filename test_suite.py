@@ -12,6 +12,7 @@ Usage:
 Env fallback: OD_USER / OD_PASS.
 """
 import sys, os, time, json, statistics, concurrent.futures as cf
+from urllib.parse import urlparse
 import requests
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
@@ -110,7 +111,11 @@ if files:
     rw = s.get(f"{BASE}/raw?id={fid}", headers={"Range": "bytes=0-63"}, timeout=30)
     ok("/raw inline + range", rw.status_code == 206 and rw.headers.get("Content-Disposition") == "inline")
     vw = s.get(f"{BASE}/view?id={fid}", timeout=30)
-    ok("/view shell renders + embeds CDN", vw.status_code == 200 and "microsoftpersonalcontent" in vw.text)
+    # The shell must embed whatever signed url /link handed out — matching Microsoft's real
+    # CDN host exactly would make this unrunnable against tests/mock_graph.py.
+    cdn_host = urlparse(lk.get("url", "")).netloc
+    ok("/view shell renders + embeds the signed CDN url",
+       vw.status_code == 200 and bool(cdn_host) and cdn_host in vw.text, cdn_host)
 
 # ── 5. Concurrency ────────────────────────────────────────────────────────────
 print("\n[5] Concurrency — 25 parallel authed /ls")

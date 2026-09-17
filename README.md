@@ -9,8 +9,10 @@ straight from Microsoft's CDN**, an Ace code editor, and custom media players.
 ## Features
 
 - **Self-hosted auth gate** — a setup screen locks the whole instance behind a username + password
-  (Basic, or **AES-256-GCM Secure** mode that encrypts the Microsoft token at rest with your
+  (Basic, or **AES-256-GCM Secure** mode that encrypts the token at rest with your
   password). All crypto runs in the browser (Web Crypto); every API route is session-gated.
+- **Multiple accounts** — connect several Microsoft accounts and switch between them from the
+  sidebar (Add account / switch / remove). Switching is instant and needs no redeploy.
 - **In-app Microsoft auth** — device-code flow right in the UI (code + link + live yellow→green status).
   No app registration; uses Microsoft's own *Graph Command Line Tools* public client, which is
   pre-authorized for `Files.ReadWrite.All`. Tokens persist to `.env` and refresh every 10 min.
@@ -82,6 +84,15 @@ python test_suite.py https://your.app --user alex --pass yourpass
 ```
 Covers auth gating (unauth blocked, wrong-password rejected), login/session, latency, CRUD,
 range streaming, `/raw` + `/view`, and 25-way concurrency.
+
+## Hosting on a shared platform (Wasmer etc.)
+
+Public shared hosts run automated abuse detection. An OAuth **device-code** login page carrying
+**cloud-provider branding** looks like a phishing kit to those scanners, so a public deploy can get
+auto-disabled even though it's legitimate (it only ever sends you to the provider's *real* sign-in
+page and never sees your password). This UI is intentionally **de-branded** (generic name/icon, no
+provider logos) to minimise that signal — but a public device-code page can still be flagged. For a
+guaranteed-stable deploy, **self-host** (e.g. a home server / Pi) and reach it privately.
 
 ## Notes / limits
 

@@ -22,6 +22,7 @@ Then open the URL it prints (default http://localhost:3000).
 """
 
 import os
+import re
 import time
 import json
 import base64
@@ -82,12 +83,17 @@ def _read_yml_blob(path):
     if not os.path.exists(path):
         return None
     try:
-        for line in open(path, encoding="utf-8"):
-            line = line.strip()
-            if line.startswith("data:"):
-                val = line.split(":", 1)[1].strip().strip("\"'")
-                if val and "PASTE" not in val.upper():
-                    return json.loads(_b64d(val).decode())
+        text = open(path, encoding="utf-8").read()
+        m = re.search(r"data:\s*(.+)", text, re.S)   # everything after the first `data:`
+        if not m:
+            return None
+        # Strip anything a paste/editor might inject (wrapping, whitespace, quotes); keep only
+        # base64url chars. This makes "already configured?" detection robust so a redeploy never
+        # bounces a done step back to setup.
+        raw = re.sub(r"[^A-Za-z0-9_\-]", "", m.group(1))
+        if not raw or "PASTE" in raw.upper():
+            return None
+        return json.loads(_b64d(raw).decode())
     except Exception as e:
         print(f"[config] could not parse {os.path.basename(path)}: {e}")
     return None
@@ -157,9 +163,61 @@ def is_authed():
     return valid_session(request.cookies.get("od_sess")) is not None
 
 
+# ── Multi-account ─────────────────────────────────────────────────────────────
+# token.yml holds a list of accounts; basic entries carry the refresh token, secure entries
+# carry its AES-GCM ciphertext. The ACTIVE account is a per-runtime choice (switching does NOT
+# rewrite token.yml — only add/remove do), so switching accounts never needs a commit.
+ACCOUNTS = []          # [{"id":.., "email":..}] for the UI
+RT_STORE = {}          # id -> refresh_token (basic: from file at boot; secure: after unlock)
+ACTIVE   = {"id": None}
+
+
+def _account_entries(cfg):
+    """Normalize token.yml into a list of account entries (handles the old single-account format)."""
+    if not cfg:
+        return []
+    if isinstance(cfg.get("accounts"), list):
+        return cfg["accounts"]
+    e = {"id": "acct1", "email": cfg.get("email", "")}
+    if cfg.get("method") == "basic" and cfg.get("rt"):
+        e["rt"] = cfg["rt"]; return [e]
+    if cfg.get("method") == "secure" and cfg.get("ct"):
+        e.update({"iv": cfg["iv"], "ct": cfg["ct"]}); return [e]
+    return []
+
+
+def build_token_blob(entries):
+    b = {"method": CREDS["method"], "accounts": entries}
+    if CREDS and CREDS.get("method") == "secure":
+        b["enc_salt"] = CREDS["enc_salt"]; b["iters"] = CREDS["iters"]
+    return b
+
+
+def load_accounts():
+    ACCOUNTS.clear()
+    for e in _account_entries(TOKENCFG):
+        ACCOUNTS.append({"id": e["id"], "email": e.get("email", "")})
+        if e.get("rt"):                       # basic: usable immediately
+            RT_STORE[e["id"]] = e["rt"]
+    if ACCOUNTS and (ACTIVE["id"] not in {a["id"] for a in ACCOUNTS}):
+        set_active(ACCOUNTS[0]["id"])
+
+
+def set_active(aid):
+    ACTIVE["id"] = aid
+    if aid in RT_STORE:
+        with _lock:
+            TOKENS["refresh_token"] = RT_STORE[aid]
+            TOKENS["expires_at"] = 0
+            TOKENS["access_token"] = None
+        TOKENS["email"] = next((a["email"] for a in ACCOUNTS if a["id"] == aid), None)
+        return True
+    return False
+
+
 def token_available():
-    """True when we actually hold a usable refresh token (basic: from file; secure: after unlock)."""
-    return bool(TOKENS.get("refresh_token"))
+    """True when the active account has a usable refresh token (basic: file; secure: after unlock)."""
+    return bool(ACTIVE["id"] and RT_STORE.get(ACTIVE["id"]))
 
 
 def require_auth(fn):
@@ -384,18 +442,27 @@ def auth_reset():
 
 
 # ── Setup / login / connect (GitOps config flow) ──────────────────────────────
+def _secure_enc_payload():
+    """For secure mode: everything the browser needs to decrypt every account's token."""
+    if (TOKENCFG or {}).get("method") != "secure":
+        return None
+    return {
+        "enc_salt": TOKENCFG.get("enc_salt"), "iters": TOKENCFG.get("iters"),
+        "accounts": [{"id": e["id"], "iv": e.get("iv"), "ct": e.get("ct")}
+                     for e in _account_entries(TOKENCFG) if e.get("ct")],
+    }
+
+
 @app.route("/api/state")
 def api_state():
     """Public: tells the front controller which screen to show."""
-    st = app_state()
     return jsonify({
-        "state": st,
+        "state": app_state(),
         "authed": is_authed(),
         "token_ready": token_available(),
         "method": (CREDS or {}).get("method"),
         "user": (CREDS or {}).get("user"),
-        # secure-mode unlock material (only meaningful once authed + token configured)
-        "token_enc": (TOKENCFG if (TOKENCFG or {}).get("method") == "secure" else None),
+        "token_enc": _secure_enc_payload(),   # secure-mode unlock material
     })
 
 
@@ -430,8 +497,7 @@ def api_login():
         return jsonify({"ok": False, "error": "wrong username or password"}), 401
     resp = make_response(jsonify({
         "ok": True, "state": app_state(), "method": CREDS["method"],
-        "token_ready": token_available(),
-        "token_enc": (TOKENCFG if (TOKENCFG or {}).get("method") == "secure" else None),
+        "token_ready": token_available(), "token_enc": _secure_enc_payload(),
     }))
     resp.set_cookie("od_sess", sign_session(CREDS["user"]), httponly=True, samesite="Lax",
                     secure=request.is_secure, max_age=720 * 3600)
@@ -448,41 +514,94 @@ def api_logout():
 @app.route("/api/unlock", methods=["POST"])
 @require_auth
 def api_unlock():
-    """Secure mode: browser decrypted token.yml client-side and posts the refresh token to unlock."""
-    rt = (request.get_json(force=True) or {}).get("rt")
-    if not rt:
-        return jsonify({"ok": False, "error": "no token"}), 400
-    with _lock:
-        TOKENS["refresh_token"] = rt
-        TOKENS["expires_at"] = 0
+    """Secure mode: browser decrypted every account's token client-side and posts them here."""
+    d = request.get_json(force=True) or {}
+    rts = d.get("rts") or ({ACCOUNTS[0]["id"]: d["rt"]} if d.get("rt") and ACCOUNTS else {})
+    if not rts:
+        return jsonify({"ok": False, "error": "no tokens"}), 400
+    RT_STORE.update(rts)
     _UNLOCKED["ok"] = True
+    set_active(ACTIVE["id"] if ACTIVE["id"] in RT_STORE else next(iter(rts)))
     return jsonify({"ok": bool(refresh_now())})
 
 
 @app.route("/api/connect/token")
 @require_auth
 def api_connect_token():
-    """After device-code success, hand the refresh token to the authed browser to build token.yml."""
+    """After device-code success, hand the new account's token + existing accounts to the browser."""
     if not TOKENS.get("refresh_token"):
         return jsonify({"ok": False, "error": "not connected yet"}), 409
-    return jsonify({"ok": True, "rt": TOKENS["refresh_token"], "method": CREDS["method"],
-                    "enc_salt": (CREDS or {}).get("enc_salt"), "iters": (CREDS or {}).get("iters")})
+    return jsonify({
+        "ok": True, "id": secrets.token_hex(5), "rt": TOKENS["refresh_token"],
+        "email": TOKENS.get("email") or "", "method": CREDS["method"],
+        "enc_salt": (CREDS or {}).get("enc_salt"), "iters": (CREDS or {}).get("iters"),
+        "existing": _account_entries(TOKENCFG),   # so the browser can append, not overwrite
+    })
 
 
 @app.route("/api/setup/token", methods=["POST"])
 @require_auth
 def api_setup_token():
-    """Step 3: browser built the token.yml blob (basic: rt; secure: encrypted). Wrap + return code."""
+    """Browser built the full token.yml blob (all accounts). Persist + activate."""
     global TOKENCFG
-    blob = (request.get_json(force=True) or {}).get("blob")
-    if not blob or blob.get("method") not in ("basic", "secure"):
+    d = request.get_json(force=True) or {}
+    blob = d.get("blob")
+    if not blob or blob.get("method") not in ("basic", "secure") or not isinstance(blob.get("accounts"), list):
         return jsonify({"ok": False, "error": "bad token blob"}), 400
     yml = make_yml(blob, "token")
     TOKENCFG = blob
-    if blob["method"] == "basic":
-        TOKENS["refresh_token"] = blob.get("rt")
+    load_accounts()
+    # The account just connected already has its live refresh token in TOKENS — make it usable now
+    # (secure entries are otherwise locked until an unlock).
+    aid = d.get("active_id")
+    if aid and TOKENS.get("refresh_token"):
+        RT_STORE[aid] = TOKENS["refresh_token"]
+        set_active(aid)
     wrote = try_write(TOKEN_PATH, yml)
     return jsonify({"ok": True, "code": yml, "wrote_local": wrote})
+
+
+# ── Account management ────────────────────────────────────────────────────────
+@app.route("/api/accounts")
+@require_auth
+def api_accounts():
+    return jsonify({
+        "accounts": [{"id": a["id"], "email": a["email"],
+                      "active": a["id"] == ACTIVE["id"], "unlocked": a["id"] in RT_STORE}
+                     for a in ACCOUNTS],
+        "active": ACTIVE["id"],
+    })
+
+
+@app.route("/api/accounts/switch", methods=["POST"])
+@require_auth
+def api_accounts_switch():
+    aid = (request.get_json(force=True) or {}).get("id")
+    if aid not in {a["id"] for a in ACCOUNTS}:
+        return jsonify({"ok": False, "error": "no such account"}), 404
+    if aid not in RT_STORE:
+        return jsonify({"ok": False, "error": "locked", "need_unlock": True}), 423
+    set_active(aid)
+    return jsonify({"ok": True, "email": TOKENS.get("email")})
+
+
+@app.route("/api/accounts/remove", methods=["POST"])
+@require_auth
+def api_accounts_remove():
+    global TOKENCFG
+    aid = (request.get_json(force=True) or {}).get("id")
+    entries = [e for e in _account_entries(TOKENCFG) if e["id"] != aid]
+    blob = build_token_blob(entries) if entries else None
+    if blob is None:
+        return jsonify({"ok": False, "error": "cannot remove the last account — use Sign out instead"}), 400
+    yml = make_yml(blob, "token")
+    TOKENCFG = blob
+    RT_STORE.pop(aid, None)
+    if ACTIVE["id"] == aid:
+        ACTIVE["id"] = None
+    load_accounts()
+    wrote = try_write(TOKEN_PATH, yml)
+    return jsonify({"ok": True, "code": yml, "wrote_local": wrote, "active": ACTIVE["id"]})
 
 
 # ── Drive data ────────────────────────────────────────────────────────────────
@@ -783,7 +902,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OneDrive</title>
+<title>Nimbus</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ext-modelist.min.js"></script>
@@ -867,7 +986,26 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 .avatar{width:33px;height:33px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:12px;color:#fff}
 .side-foot .who{font-size:.78rem;color:var(--text1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .side-foot .who small{display:block;color:var(--text2);font-size:.66rem;cursor:pointer}
-.side-foot .who small:hover{color:var(--danger)}
+.side-foot{cursor:pointer;border-radius:12px;padding:10px;transition:background .16s;position:relative}
+.side-foot:hover{background:rgba(255,255,255,.05)}
+.side-foot .who{flex:1}
+.side-foot .who small{color:var(--text2);pointer-events:none}
+#acctMenu{display:none;position:absolute;bottom:74px;left:14px;right:14px;z-index:60;padding:6px;border-radius:14px;
+  background:rgba(24,24,38,.97);backdrop-filter:blur(16px);border:1px solid var(--stroke2);box-shadow:0 16px 48px rgba(0,0,0,.6);
+  transform-origin:bottom;animation:acctIn .22s cubic-bezier(.2,.9,.25,1)}
+#acctMenu.on{display:block}
+@keyframes acctIn{from{opacity:0;transform:translateY(8px) scale(.97)}to{opacity:1;transform:none}}
+.acct-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;cursor:pointer;transition:background .13s}
+.acct-row:hover{background:rgba(255,255,255,.06)}
+.acct-row .ai{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;flex-shrink:0}
+.acct-row .an{flex:1;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-row .active-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.acct-row .rm{opacity:0;color:var(--text2);font-size:11px;padding:3px 5px;border-radius:5px}
+.acct-row:hover .rm{opacity:1}.acct-row .rm:hover{color:var(--danger);background:var(--danger-bg)}
+.acct-act{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:10px;cursor:pointer;font-size:.8rem;color:var(--text1);transition:background .13s}
+.acct-act:hover{background:rgba(255,255,255,.06);color:#fff}.acct-act i{width:15px;text-align:center;color:var(--text2)}
+.acct-act.danger:hover{color:var(--danger)} .acct-act.danger:hover i{color:var(--danger)}
+.acct-sep{height:1px;background:var(--stroke);margin:4px 2px}
 
 #main{flex:1;display:flex;flex-direction:column;border-radius:var(--radius-lg);overflow:hidden;min-width:0}
 #top{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--stroke)}
@@ -1050,6 +1188,13 @@ tr:hover .racts{opacity:1}
 .tb:hover{transform:translateY(-1px)}
 #stFill,#storage-fill{transition:width .6s cubic-bezier(.2,.9,.25,1),background .4s}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+/* add-account modal bits */
+.am-lbl{font-size:.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.am-big{font-size:1.7rem;font-weight:700;letter-spacing:.2em;font-family:'Consolas',monospace;text-align:center;color:#fff;
+  text-shadow:0 0 20px var(--accent-glow);cursor:pointer;user-select:all;padding:14px;background:rgba(0,0,0,.35);border-radius:12px;border:1px solid var(--stroke2)}
+.am-link{display:flex;align-items:center;justify-content:center;gap:8px;padding:11px;margin-top:12px;border-radius:11px;border:1px solid var(--stroke2);background:rgba(0,0,0,.25);color:var(--text0);text-decoration:none;font-size:.86rem;font-weight:600}
+.am-link:hover{border-color:var(--accent)}
+.codebox2 textarea{width:100%;height:90px;resize:none;font-family:'Consolas',monospace;font-size:.68rem;line-height:1.5;color:#cdd3e0;background:rgba(0,0,0,.4);border:1px solid var(--stroke2);border-radius:11px;padding:11px;outline:none;word-break:break-all}
 </style>
 </head>
 <body>
@@ -1058,12 +1203,12 @@ tr:hover .racts{opacity:1}
 <div id="auth">
   <div class="auth-card glass">
     <div class="auth-top">
-      <div class="brand-mark"><i class="fa-brands fa-microsoft"></i></div>
-      <div><h1>OneDrive</h1><p>Device-code sign-in</p></div>
+      <div class="brand-mark"><i class="fa-solid fa-cloud"></i></div>
+      <div><h1>Nimbus</h1><p>Secure file access</p></div>
     </div>
     <div class="status-row"><span class="dot" id="dot"></span><span id="statusText">Checking session…</span></div>
     <div id="preAuth">
-      <button class="btn" id="startBtn" onclick="startAuth()"><i class="fa-solid fa-right-to-bracket"></i> Sign in with Microsoft</button>
+      <button class="btn" id="startBtn" onclick="startAuth()"><i class="fa-solid fa-right-to-bracket"></i> Connect account</button>
     </div>
     <div id="codeWrap" style="display:none;flex-direction:column;gap:16px">
       <div class="code-box">
@@ -1071,7 +1216,7 @@ tr:hover .racts{opacity:1}
         <div class="code-val" id="codeVal" onclick="copyCode()">— — — — —</div>
         <div class="copy-hint" id="copyHint">tap to copy</div>
       </div>
-      <a class="link-btn" id="verifyLink" href="https://microsoft.com/devicelogin" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open microsoft.com/devicelogin</a>
+      <a class="link-btn" id="verifyLink" href="https://microsoft.com/devicelogin" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open the sign-in page</a>
       <div class="status-row" style="justify-content:center"><span class="dot pending" id="waitDot"></span><span style="font-size:.8rem;color:var(--text2)">Waiting for you to approve…</span></div>
     </div>
   </div>
@@ -1081,8 +1226,8 @@ tr:hover .racts{opacity:1}
 <div id="app">
   <aside id="side" class="glass">
     <div class="side-brand">
-      <div class="brand-mark"><i class="fa-brands fa-microsoft"></i></div>
-      <div><h2>OneDrive</h2><small>Explorer</small></div>
+      <div class="brand-mark"><i class="fa-solid fa-cloud"></i></div>
+      <div><h2>Nimbus</h2><small>Files</small></div>
     </div>
     <div class="store">
       <div class="store-top"><span><i class="fa-solid fa-hard-drive"></i> Storage</span><b id="stPct">—</b></div>
@@ -1097,9 +1242,15 @@ tr:hover .racts{opacity:1}
       <div class="nav-i" onclick="mkdir()"><i class="fa-solid fa-folder-plus"></i> New folder</div>
       <div class="nav-i" onclick="newTextFile()"><i class="fa-solid fa-file-circle-plus"></i> New file</div>
     </div>
-    <div class="side-foot">
+    <div class="side-foot" id="acctChip" onclick="toggleAcctMenu(event)">
       <div class="avatar"><i class="fa-solid fa-user"></i></div>
-      <div class="who"><span id="who">Connected</span><small onclick="signOut()">Sign out</small></div>
+      <div class="who"><span id="who">Connected</span><small id="acctSub">switch account</small></div>
+      <i class="fa-solid fa-chevron-up" id="acctCaret" style="color:var(--text2);font-size:11px;transition:transform .2s"></i>
+    </div>
+    <div id="acctMenu">
+      <div class="acct-list" id="acctList"></div>
+      <div class="acct-act" onclick="addAccount()"><i class="fa-solid fa-plus"></i> Add account</div>
+      <div class="acct-act danger" onclick="signOut()"><i class="fa-solid fa-right-from-bracket"></i> Sign out</div>
     </div>
   </aside>
 
@@ -1118,7 +1269,7 @@ tr:hover .racts{opacity:1}
       <button class="tb" onclick="renameSel()"><i class="fa-solid fa-pencil"></i> Rename</button>
       <button class="tb dng" onclick="delSelected()"><i class="fa-solid fa-trash"></i> Delete</button>
       <div class="tb-sep"></div>
-      <button class="tb" id="turboBtn" onclick="toggleTurbo()" title="Turbo routes uploads through the server (~44 MB/s) instead of browser→Microsoft direct (~13 MB/s). Uses server bandwidth — leave OFF on Wasmer."><i class="fa-solid fa-bolt"></i> Turbo</button>
+      <button class="tb" id="turboBtn" onclick="toggleTurbo()" title="Turbo routes uploads through the server (~44 MB/s) instead of browser→provider direct (~13 MB/s). Uses server bandwidth — leave OFF on Wasmer."><i class="fa-solid fa-bolt"></i> Turbo</button>
       <div class="view-toggle">
         <button class="vb active" id="vList" onclick="setView('list')"><i class="fa-solid fa-list"></i></button>
         <button class="vb" id="vGrid" onclick="setView('grid')"><i class="fa-solid fa-border-all"></i></button>
@@ -1180,6 +1331,22 @@ tr:hover .racts{opacity:1}
   <div class="ut-rate" id="utRate"></div>
 </div>
 <div class="app-toast" id="appToast"><i class="fa-solid fa-check" id="appToastI"></i><span id="appToastT"></span></div>
+<div class="mask" id="acctModal"><div class="dlg glass" style="width:440px">
+  <h3><i class="fa-solid fa-user-plus" style="color:var(--accent)"></i> Add account</h3>
+  <div id="am-start"><p style="font-size:.85rem;color:var(--text1);line-height:1.5;margin-bottom:16px">Connect another Microsoft account. You'll approve it on the official Microsoft sign-in page.</p>
+    <div class="modal-actions"><button class="mb" onclick="closeMask('acctModal')">Cancel</button><button class="mb pri" onclick="amStart()">Connect</button></div></div>
+  <div id="am-code" style="display:none">
+    <div class="am-lbl">Enter this code</div>
+    <div class="am-big" id="am-usercode" onclick="copyText(this.textContent.trim())">— — —</div>
+    <a class="am-link" id="am-link" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open the sign-in page</a>
+    <p style="font-size:.82rem;color:var(--text2);margin-top:12px;text-align:center"><span class="spin"></span> <span id="am-status">Waiting for approval…</span></p>
+  </div>
+  <div id="am-commit" style="display:none">
+    <p style="font-size:.85rem;color:var(--text1);margin-bottom:12px" id="am-commit-msg"></p>
+    <div class="codebox2"><textarea id="am-ta" readonly></textarea><button class="mb pri" style="width:100%;margin-top:10px" onclick="amCopy()"><i class="fa-solid fa-copy"></i> Copy token.yml code</button></div>
+    <div class="modal-actions" style="margin-top:14px"><button class="mb pri" onclick="closeMask('acctModal');refresh();loadAccounts()">Done</button></div>
+  </div>
+</div></div>
 
 <script>
 const IMG=new Set(['jpg','jpeg','png','gif','webp','bmp','svg','avif','ico']);
@@ -1219,9 +1386,87 @@ async function enterApp(email){
   // turbo default from server (TURBO_UPLOAD env), overridable per-browser
   try{ const cfg=await fetch('/config').then(r=>r.json()); TURBO=(localStorage.getItem('od_turbo')??(cfg.turbo?'1':'0'))==='1'; }catch(e){}
   $('turboBtn').classList.toggle('pri',TURBO);
-  loadStorage(); load('root');
+  loadAccounts(); loadStorage(); load('root');
 }
 async function signOut(){ await fetch('/api/logout',{method:'POST'}); location.href='/'; }
+
+/* ── Accounts (multi-account switcher) ── */
+const CB={ e:b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_'),
+  d:s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0));}, rand:n=>crypto.getRandomValues(new Uint8Array(n)) };
+async function aesEnc(pass,saltB64,iters,text){
+  const k0=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:CB.d(saltB64),iterations:iters,hash:'SHA-256'},k0,{name:'AES-GCM',length:256},false,['encrypt']);
+  const iv=CB.rand(12); const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(text));
+  return {iv:CB.e(iv),ct:CB.e(ct)};
+}
+let ACCTS=[];
+async function loadAccounts(){
+  const d=await fetch('/api/accounts').then(r=>r.json()).catch(()=>({accounts:[]}));
+  ACCTS=d.accounts||[]; const active=ACCTS.find(a=>a.active);
+  if(active)$('who').textContent=active.email||'Connected';
+  $('acctSub').textContent=ACCTS.length>1?ACCTS.length+' accounts':'switch account';
+  const list=$('acctList'); list.innerHTML='';
+  for(const a of ACCTS){
+    const row=document.createElement('div'); row.className='acct-row';
+    row.innerHTML=`<div class="ai"><i class="fa-solid fa-user"></i></div><div class="an">${esc(a.email||a.id)}</div>`+
+      (a.active?'<div class="active-dot"></div>':'')+
+      (ACCTS.length>1?`<div class="rm" title="Remove" onclick="event.stopPropagation();removeAccount('${a.id}')"><i class="fa-solid fa-xmark"></i></div>`:'');
+    if(!a.active) row.onclick=()=>switchAccount(a.id);
+    list.appendChild(row);
+  }
+}
+function toggleAcctMenu(e){ if(e&&e.target.closest('.rm'))return; const on=$('acctMenu').classList.toggle('on'); $('acctCaret').style.transform=on?'rotate(180deg)':''; }
+document.addEventListener('click',e=>{ if(!e.target.closest('#acctChip')&&!e.target.closest('#acctMenu')){ $('acctMenu').classList.remove('on'); $('acctCaret').style.transform=''; }});
+async function switchAccount(id){
+  const r=await fetch('/api/accounts/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json());
+  $('acctMenu').classList.remove('on'); $('acctCaret').style.transform='';
+  if(r.ok){ goRoot(); loadStorage(); loadAccounts(); toast('Switched to '+(r.email||'account'),'fa-user-check'); }
+  else if(r.need_unlock) toast('That account is locked — reload page to unlock','fa-lock');
+  else toast(r.error||'Switch failed');
+}
+async function removeAccount(id){
+  if(!confirm('Remove this account from the drive?'))return;
+  const r=await fetch('/api/accounts/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json());
+  if(!r.ok){ toast(r.error||'Remove failed'); return; }
+  if(r.wrote_local){ toast('Account removed'); goRoot(); loadStorage(); loadAccounts(); }
+  else { openMask('acctModal'); amShowCommit('Account removed. Replace token.yml with this code, commit & redeploy:', r.code); }
+}
+/* add account */
+let amPoll=null, amPass=null;
+function openMask(id){ $(id).classList.add('open'); }
+function copyText(t){ navigator.clipboard.writeText(t).then(()=>toast('Copied to clipboard')).catch(()=>{}); }
+function addAccount(){ $('acctMenu').classList.remove('on'); $('am-start').style.display='block'; $('am-code').style.display='none'; $('am-commit').style.display='none'; openMask('acctModal'); }
+async function amStart(){
+  const st=await fetch('/api/state').then(r=>r.json());
+  if(st.method==='secure'){ amPass=prompt('Enter your password to encrypt the new account token:'); if(!amPass)return; }
+  $('am-start').style.display='none'; $('am-code').style.display='block'; $('am-status').textContent='Requesting code…';
+  const r=await fetch('/auth/start',{method:'POST'}).then(r=>r.json());
+  if(!r.ok){ $('am-status').textContent='Error: '+(r.error||'failed'); return; }
+  $('am-usercode').textContent=r.user_code; $('am-link').href=r.verification_uri; copyText(r.user_code); $('am-status').textContent='Waiting for approval…';
+  if(amPoll)clearInterval(amPoll);
+  amPoll=setInterval(async()=>{
+    const s=await fetch('/status').then(r=>r.json()).catch(()=>({}));
+    if(s.error){ clearInterval(amPoll); $('am-status').textContent=s.error; return; }
+    if(s.pending===false){ clearInterval(amPoll); amFinish(); }
+  },2500);
+}
+async function amFinish(){
+  $('am-status').textContent='Building token…';
+  const t=await fetch('/api/connect/token').then(r=>r.json());
+  if(!t.ok){ $('am-status').textContent='Could not read token.'; return; }
+  const acct={id:t.id,email:t.email};
+  if(t.method==='secure'){ if(!amPass){$('am-status').textContent='Password missing.';return;} const enc=await aesEnc(amPass,t.enc_salt,t.iters,t.rt); acct.iv=enc.iv; acct.ct=enc.ct; amPass=null; }
+  else acct.rt=t.rt;
+  const blob = t.method==='secure'
+    ? {method:'secure',enc_salt:t.enc_salt,iters:t.iters,accounts:[...(t.existing||[]),acct]}
+    : {method:'basic',accounts:[...(t.existing||[]),acct]};
+  const r=await fetch('/api/setup/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({blob,active_id:t.id})}).then(r=>r.json());
+  if(!r.ok){ $('am-status').textContent='Failed to save.'; return; }
+  if(r.wrote_local){ toast('Account added','fa-user-plus'); closeMask('acctModal'); goRoot(); loadStorage(); loadAccounts(); }
+  else amShowCommit('Account added. Replace token.yml with this code, commit & redeploy:', r.code);
+}
+function amShowCommit(msg,code){ $('am-start').style.display='none'; $('am-code').style.display='none'; $('am-commit').style.display='block'; $('am-commit-msg').textContent=msg; $('am-ta').value=code; }
+function amCopy(){ navigator.clipboard.writeText($('am-ta').value).then(()=>toast('Copied token.yml code')); }
 
 /* ── Listing ── */
 function setStatus(m,raw){ const e=$('stMsg'); raw?e.innerHTML=m:e.textContent=m; }
@@ -1592,7 +1837,7 @@ openRename=o=>{ if(typeof o==='string')o=JSON.parse(o.replace(/&#39;/g,"'").repl
 GATE_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OneDrive · Setup</title>
+<title>Nimbus · Setup</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{--accent:#7c6cff;--accent2:#a45cff;--ok:#3ee08f;--warn:#ffcf5c;--danger:#ff5c7a;
@@ -1658,8 +1903,8 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,108,255,.25
 </style></head>
 <body>
 <div class="card">
-  <div class="brand"><div class="mark"><i class="fa-brands fa-microsoft"></i></div>
-    <div><h1>OneDrive</h1><p>Self-hosted setup</p></div></div>
+  <div class="brand"><div class="mark"><i class="fa-solid fa-cloud"></i></div>
+    <div><h1>Nimbus</h1><p>Self-hosted setup</p></div></div>
 
   <!-- SETUP -->
   <div class="panel" id="p-setup">
@@ -1693,7 +1938,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,108,255,.25
   <!-- UNLOCK (secure, already authed) -->
   <div class="panel" id="p-unlock">
     <div class="step">Locked</div>
-    <h2>Unlock OneDrive</h2>
+    <h2>Unlock your drive</h2>
     <p class="sub">Secure mode: your token is encrypted. Enter your password to decrypt it for this session.</p>
     <label>Password</label><input id="u-pass" type="password" autocomplete="current-password">
     <div class="err" id="u-err"></div>
@@ -1702,16 +1947,16 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,108,255,.25
 
   <!-- CONNECT -->
   <div class="panel" id="p-connect">
-    <div class="step">Step 2 of 2 · Microsoft</div>
-    <h2>Connect OneDrive</h2>
-    <p class="sub">Sign in to Microsoft with a device code — nothing is installed on your account.</p>
+    <div class="step">Step 2 of 2 · Connect</div>
+    <h2>Connect your account</h2>
+    <p class="sub">Approve access on the official Microsoft sign-in page. Nothing is installed on your account.</p>
     <div id="c-start">
-      <button class="btn" onclick="startConnect()"><i class="fa-brands fa-microsoft"></i> Connect Microsoft</button>
+      <button class="btn" onclick="startConnect()"><i class="fa-solid fa-cloud"></i> Connect account</button>
     </div>
     <div id="c-code" style="display:none">
       <label>Enter this code at the link below</label>
       <div class="big" id="c-usercode" onclick="copyText(this.textContent.trim())">— — —</div>
-      <a class="linkbtn" id="c-link" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open microsoft.com/devicelogin</a>
+      <a class="linkbtn" id="c-link" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open the sign-in page</a>
       <p class="sub" style="margin-top:14px"><span class="dot pending" id="c-dot"></span><span id="c-status">Waiting for approval…</span></p>
     </div>
   </div>
@@ -1817,8 +2062,9 @@ async function doUnlock(){
   catch(e){ $('u-err').textContent='Wrong password.'; btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-key"></i> Unlock'; }
 }
 async function unlockWith(pass, enc){
-  const rt=await aesDec(pass, enc.enc_salt, enc.iters, enc.iv, enc.ct);   // throws on wrong pw
-  const r=await fetch('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rt})}).then(r=>r.json());
+  const rts={};
+  for(const a of (enc.accounts||[])){ rts[a.id]=await aesDec(pass, enc.enc_salt, enc.iters, a.iv, a.ct); } // throws on wrong pw
+  const r=await fetch('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rts})}).then(r=>r.json());
   if(!r.ok) throw new Error('unlock failed');
   location.href='/';
 }
@@ -1841,13 +2087,15 @@ async function onConnected(){
   $('c-dot').className='dot ok'; $('c-status').textContent='Connected — building token code…';
   const t=await fetch('/api/connect/token').then(r=>r.json());
   if(!t.ok){ $('c-status').textContent='Could not read token.'; return; }
-  let blob;
+  const acct={id:t.id, email:t.email};
   if(t.method==='secure'){
     if(!PASS){ $('c-status').textContent='Session expired — please log in again.'; return; }
-    const enc=await aesEnc(PASS, t.enc_salt, t.iters, t.rt);
-    blob={method:'secure', enc_salt:t.enc_salt, iters:t.iters, iv:enc.iv, ct:enc.ct};
-  } else { blob={method:'basic', rt:t.rt}; }
-  const r=await fetch('/api/setup/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({blob})}).then(r=>r.json());
+    const enc=await aesEnc(PASS, t.enc_salt, t.iters, t.rt); acct.iv=enc.iv; acct.ct=enc.ct;
+  } else { acct.rt=t.rt; }
+  const blob = t.method==='secure'
+    ? {method:'secure', enc_salt:t.enc_salt, iters:t.iters, accounts:[...(t.existing||[]), acct]}
+    : {method:'basic', accounts:[...(t.existing||[]), acct]};
+  const r=await fetch('/api/setup/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({blob, active_id:t.id})}).then(r=>r.json());
   if(!r.ok){ $('c-status').textContent=r.error||'Failed to build token.'; return; }
   showCode('token', r.code, r.wrote_local);
 }
@@ -1855,7 +2103,7 @@ async function onConnected(){
 /* ── Code output panel ── */
 function showCode(kind, code, wroteLocal){
   const file=kind==='creds'?'creds.yml':'token.yml';
-  $('code-step').textContent=kind==='creds'?'Step 1 of 2 · Credentials':'Step 2 of 2 · Microsoft';
+  $('code-step').textContent=kind==='creds'?'Step 1 of 2 · Credentials':'Step 2 of 2 · Connect';
   $('code-h').textContent='Paste this into '+file;
   $('code-sub').textContent='This code has been copied to your clipboard.';
   $('code-ta').value=code;
@@ -1889,14 +2137,12 @@ def boot():
     if _booted:
         return
     _booted = True
-    # Canonical: token.yml. basic mode holds the refresh token directly; secure mode stays
-    # locked until the user logs in and the browser posts the decrypted token to /api/unlock.
-    if TOKENCFG and TOKENCFG.get("method") == "basic" and TOKENCFG.get("rt"):
-        TOKENS["refresh_token"] = TOKENCFG["rt"]
-        print("[boot] token.yml loaded (basic)")
-    elif TOKENCFG and TOKENCFG.get("method") == "secure":
-        print("[boot] token.yml is encrypted (secure) — waiting for unlock at login")
-    else:
+    # Canonical: token.yml (multi-account). basic entries are usable now; secure entries stay
+    # locked until the browser posts decrypted tokens to /api/unlock.
+    load_accounts()
+    if ACCOUNTS:
+        print(f"[boot] token.yml loaded: {len(ACCOUNTS)} account(s), method={CREDS.get('method') if CREDS else '?'}")
+    elif not TOKENCFG:
         # Legacy local .env fallback (pre-GitOps dev sessions) when no token.yml exists.
         env = load_env()
         if env.get("REFRESH_TOKEN"):

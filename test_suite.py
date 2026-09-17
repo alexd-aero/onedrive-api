@@ -61,6 +61,10 @@ lr = s.post(f"{BASE}/api/login", json={"user": USER, "pass": PASS}, timeout=15)
 if not ok("login succeeds", lr.status_code == 200 and lr.json().get("ok")):
     print("\n  ⚠  Login failed — check credentials.\n"); sys.exit(1)
 ok("session cookie set", "od_sess" in s.cookies.get_dict())
+acc = s.get(f"{BASE}/api/accounts", timeout=15).json()
+ok("accounts list has >=1 active account", any(a.get("active") for a in acc.get("accounts", [])),
+   f"{len(acc.get('accounts', []))} account(s)")
+ok("unauth /api/accounts blocked", requests.get(f"{BASE}/api/accounts", timeout=15).status_code in (401, 403))
 
 # ── 1. Latency ────────────────────────────────────────────────────────────────
 print("\n[1] Latency — /ls, /storage x5 each (spaced)")

@@ -4,5 +4,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 ENV PORT=8080
-# Single worker (in-memory token + device-code poller must live in one process), many threads.
-CMD gunicorn -w 1 --threads 8 --timeout 600 -b 0.0.0.0:${PORT} app:app
+# App serves itself over TCP (Werkzeug, threaded). No gunicorn: it needs AF_UNIX, which
+# Wasmer's WASIX Python lacks — so we use one code path that works everywhere.
+CMD ["python", "app.py"]

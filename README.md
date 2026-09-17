@@ -42,7 +42,9 @@ durable store. (Running locally, the files are also written for you automaticall
 3. Then, still in **Danger Zone**, set the repo to **Private**. *(Do this before adding any tokens —
    `creds.yml`/`token.yml` will hold secrets.)*
 4. Go to **wasmer.app → Deploy → connect this GitHub repo**. Let Wasmer **auto-detect the
-   environment** (it reads `wasmer.toml` / `app.yaml`). Deploy.
+   environment**. The start command is `python app.py` (from the `Procfile`) — **not gunicorn**,
+   which can't run on Wasmer's WASIX Python (no `AF_UNIX`). If Wasmer asks for a run/start command,
+   use `python app.py`. Deploy.
 5. Open your app URL. `/` shows the **setup screen**:
    - **Step 1 — Credentials.** Pick **Basic** or **Secure** (AES-256-GCM), set a username + password.
      It gives you a code (auto-copied). In your fork, open **`creds.yml`** in the root, **replace the

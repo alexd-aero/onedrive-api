@@ -1922,8 +1922,14 @@ def main():
     print("\n" + "=" * 56)
     print(f"  OneDrive API  ->  http://localhost:{PORT}   (turbo={'on' if TURBO else 'off'})")
     print("=" * 56 + "\n")
+    # No gunicorn: it needs socket.AF_UNIX, which Wasmer's WASIX Python lacks. The stdlib
+    # TCP server works everywhere. Fall back to single-threaded if WASIX threads are unavailable.
     from werkzeug.serving import run_simple
-    run_simple("0.0.0.0", PORT, app, threaded=True, use_reloader=False)
+    try:
+        run_simple("0.0.0.0", PORT, app, threaded=True, use_reloader=False)
+    except (RuntimeError, OSError, AttributeError) as e:
+        print(f"[serve] threaded server unavailable ({e}); serving single-threaded")
+        run_simple("0.0.0.0", PORT, app, threaded=False, use_reloader=False)
 
 
 if __name__ == "__main__":

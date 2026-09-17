@@ -1,0 +1,14 @@
+{
+  "name": "onedrive-api-tests",
+  "private": true,
+  "type": "module",
+  "description": "Browser regression tests (puppeteer-core against system chromium)",
+  "scripts": {
+    "ui": "node test_ui.mjs",
+    "extra": "node test_extra.mjs",
+    "lint-js": "node check_js.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

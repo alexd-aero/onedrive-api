@@ -20,13 +20,27 @@ straight from Microsoft's CDN**, an Ace code editor, and custom media players.
   stream *directly* from `*.microsoftpersonalcontent.com` (CORS-enabled, HTTP-range/seekable).
   A 512 MB movie costs the host ~1 KB of metadata, not 512 MB — ideal for Wasmer's bandwidth cap.
   Signed URLs live ~59 min; a self-healing handler re-links and resumes in place if one lapses.
-- **Uploads** — browser→Microsoft direct (resumable session, ~0 host egress). Optional **⚡ Turbo**
-  routes through the host (~2× faster, uses host bandwidth) for local/unlimited deploys.
-  *OneDrive rejects parallel fragments, so S3-style multi-stream is impossible — this is measured.*
+- **Uploads** — browser→Microsoft direct (resumable session, ~0 host egress). Files under 8 MiB
+  go up in a **single request** (no upload session), which is what keeps a 25-file drop from
+  tripping Graph's burst throttle. Every request retries with backoff on 429/5xx (honouring
+  `Retry-After`), and a file that still fails has its session cancelled so it can't leave a
+  0-byte stub behind. Optional **⚡ Turbo** routes through the host for local/unlimited deploys;
+  the host *streams* fragments through rather than buffering them, so host memory stays flat
+  regardless of fragment size.
+  *OneDrive rejects parallel fragments, so S3-style multi-stream within one file is impossible —
+  this is measured.*
 - **Editor** — dark Ace editor for text/code with save; full-permission HTML preview.
 - **Players** — custom video player (buffer bar, seek, skip, fullscreen) and a glowing, animated
   audio player with a real WebAudio FFT visualizer (works off the cross-origin CDN stream).
 - Grid thumbnails, hover-prefetch (instant preview), drag-and-drop upload, sort/filter, context menu.
+- **Instant, optimistic UI** — selecting a row animates that row in place instead of rebuilding
+  the list; delete/rename/create apply immediately and reconcile with Graph in the background
+  (Graph's listings are eventually consistent, so re-listing straight after a write used to show
+  the *old* state and look like nothing had happened).
+- **Reverse-proxy ready** — honours `X-Forwarded-Proto/Host/Prefix` and resolves its own base
+  path, so it works mounted under a prefix (`https://host/od`). The sign-in screen reports what
+  went wrong instead of rendering a blank card, and falls back to a pure-JS PBKDF2 when served
+  over plain http (where browsers don't expose `crypto.subtle`).
 
 ## Setup model (GitOps)
 
@@ -76,6 +90,17 @@ TURBO_UPLOAD=1 python app.py   # faster host-proxied uploads (uses host bandwidt
 process; scale with threads, not workers).
 
 ## Test
+
+Offline tests run the whole app against a mock Microsoft Graph — no credentials, no real
+OneDrive. See **[`tests/README.md`](tests/README.md)**:
+
+```bash
+./tests/restart.sh --port 3300 --mock 5999 --proxy 3400
+python tests/test_server.py     # throttling, uploads, batch delete, proxy headers
+node   tests/test_ui.mjs        # real Chromium: gate behind a proxy, selection, delete, 25-file upload
+node   tests/test_extra.mjs     # grid view, insecure-context login, gate error reporting
+```
+
 
 ```bash
 python test_suite.py --user alex --pass yourpass            # smoke + stress (24 checks)

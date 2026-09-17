@@ -170,5 +170,43 @@ lr2 = requests.post(f"{a.app}/api/login", json={"user": a.user, "pass": a.passwo
 ok("and not over plain http", "Secure" not in lr2.headers.get("Set-Cookie", ""),
    lr2.headers.get("Set-Cookie", "")[:90])
 
+# ── 8. host-driven turbo stream ───────────────────────────────────────────────
+print("\n[8] Turbo stream: host drives the fragment protocol")
+reset()
+N = 48 * MiB
+blob = os.urandom(N)
+t0 = time.time()
+r = s.put(f"{a.app}/upload/stream", params={"parent_id": "root", "name": "turbo.bin", "size": N},
+          data=blob, headers={"Content-Type": "application/octet-stream"}, timeout=300)
+dt = time.time() - t0
+ok("one request uploads the whole file", r.status_code == 200 and r.json().get("ok"),
+   f"HTTP {r.status_code} in {dt:.1f}s ({N/MiB/dt:.0f} MB/s)")
+st = files()
+ok("bytes land intact", st["files"].get("turbo.bin") == N, st["files"].get("turbo.bin"))
+ok("no session left open", st["open_sessions"] == 0, st["open_sessions"])
+
+# The regression that hung a client for 20 minutes: the reader thread touched Flask's
+# thread-local `request`, died instantly, and we answered while the client was still
+# sending — leaving it blocked writing into a socket nobody drained.
+print("\n[9] A mid-upload failure answers instead of hanging the client")
+reset(session_ttl=1, chunk_delay=0.7)
+N = 96 * MiB
+t0 = time.time()
+try:
+    r = s.put(f"{a.app}/upload/stream",
+              params={"parent_id": "root", "name": "halfway.bin", "size": N},
+              data=os.urandom(N), headers={"Content-Type": "application/octet-stream"},
+              timeout=90)
+    dt = time.time() - t0
+    body = r.json()
+    ok("client gets a response, not a hang", True, f"HTTP {r.status_code} in {dt:.1f}s")
+    ok("failure is reported as resumable", body.get("resumable") is True, body.get("error"))
+    ok("with the committed offset to resume from",
+       isinstance(body.get("offset"), int) and body["offset"] > 0, body.get("offset"))
+    ok("and the session url", bool(body.get("uploadUrl")))
+except requests.exceptions.Timeout:
+    ok("client gets a response, not a hang", False, "timed out — the deadlock is back")
+reset()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

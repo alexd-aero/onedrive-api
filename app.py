@@ -28,8 +28,10 @@ import json
 import base64
 import hmac
 import hashlib
+import mimetypes
 import secrets
 import threading
+import queue
 import functools
 import concurrent.futures as cf
 import requests
@@ -431,14 +433,41 @@ def gpatch(path, body=None):
                            json=body))
 
 
-def signed_url(item_id):
+def signed_item(item_id):
+    """(signed CDN url, file name, error) — one Graph call for both."""
     data = gh(f"/me/drive/items/{item_id}")
     if "error" in data:
-        return None, data["error"].get("message", "Graph error")
+        return None, None, data["error"].get("message", "Graph error")
     url = data.get("@microsoft.graph.downloadUrl")
     if not url:
-        return None, "No download URL (folder or vault item)"
-    return url, None
+        return None, None, "No download URL (folder or vault item)"
+    return url, data.get("name"), None
+
+
+def signed_url(item_id):
+    url, _name, err = signed_item(item_id)
+    return url, err
+
+
+def guess_type(name):
+    """
+    Content type from the file name rather than whatever the CDN labels the bytes.
+
+    OneDrive hands most things back as application/octet-stream, which browsers refuse to
+    execute from a script tag and render as a download rather than as source — so a raw
+    link to a .js or .css is useless without this.
+    """
+    if not name:
+        return None
+    ctype, _ = mimetypes.guess_type(name)
+    if ctype:
+        return ctype
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return {"md": "text/markdown", "ts": "text/plain", "tsx": "text/plain",
+            "jsx": "text/plain", "yml": "text/yaml", "yaml": "text/yaml",
+            "toml": "text/plain", "rs": "text/plain", "go": "text/plain",
+            "sh": "text/x-shellscript", "log": "text/plain",
+            "conf": "text/plain", "ini": "text/plain"}.get(ext)
 
 
 # ── Device-code auth flow ─────────────────────────────────────────────────────
@@ -795,24 +824,37 @@ def dl():
 @require_auth
 def stream():
     """Same-origin range proxy. Used for the audio visualizer (needs same-origin) and as a CORS fallback."""
-    item_id = request.args.get("id")
-    url, err = signed_url(item_id)
+    url, name, err = signed_item(request.args.get("id"))
     if err:
         return jsonify({"error": err}), 404
+    return proxy_bytes(url, name, cache="no-store", allow_dl=True)
+
+
+def proxy_bytes(url, name=None, *, cache="no-store", allow_dl=False):
+    """
+    Stream a signed CDN url back to the client, inline, with range support.
+
+    Content type comes from the file name where we can work it out: OneDrive labels most
+    things application/octet-stream, which browsers will not execute from a script tag and
+    show as a download instead of as source.
+    """
     upstream_headers = {}
     if "Range" in request.headers:
         upstream_headers["Range"] = request.headers["Range"]
     up = S.get(url, headers=upstream_headers, stream=True, timeout=60)
     resp_headers = {
-        "Content-Type": up.headers.get("Content-Type", "application/octet-stream"),
+        "Content-Type": (guess_type(name)
+                         or up.headers.get("Content-Type", "application/octet-stream")),
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
+        "Content-Disposition": "inline",
+        "Cache-Control": cache,
     }
     for h in ("Content-Length", "Content-Range"):
         if h in up.headers:
             resp_headers[h] = up.headers[h]
-    if request.args.get("dl"):
-        resp_headers["Content-Disposition"] = f'attachment; filename="{request.args.get("name", "file")}"'
+    if allow_dl and request.args.get("dl"):
+        resp_headers["Content-Disposition"] = (
+            f'attachment; filename="{request.args.get("name", "file")}"')
     return Response(stream_with_context(up.iter_content(256 * 1024)),
                     status=up.status_code if up.status_code in (200, 206) else 200,
                     headers=resp_headers)
@@ -828,26 +870,10 @@ def raw():
     proxy with Content-Disposition: inline + range support — so /raw?id=... works forever (while the
     app runs) and opens in the browser like a raw file link.
     """
-    item_id = request.args.get("id")
-    url, err = signed_url(item_id)
+    url, name, err = signed_item(request.args.get("id"))
     if err:
         return jsonify({"error": err}), 404
-    upstream_headers = {}
-    if "Range" in request.headers:
-        upstream_headers["Range"] = request.headers["Range"]
-    up = S.get(url, headers=upstream_headers, stream=True, timeout=60)
-    resp_headers = {
-        "Content-Type": up.headers.get("Content-Type", "application/octet-stream"),
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": "inline",
-        "Cache-Control": "public, max-age=3600",
-    }
-    for h in ("Content-Length", "Content-Range"):
-        if h in up.headers:
-            resp_headers[h] = up.headers[h]
-    return Response(stream_with_context(up.iter_content(256 * 1024)),
-                    status=up.status_code if up.status_code in (200, 206) else 200,
-                    headers=resp_headers)
+    return proxy_bytes(url, name, cache="public, max-age=3600")
 
 
 VIEW_HTML = r"""<!DOCTYPE html><html lang="en"><head>
@@ -904,7 +930,21 @@ def view():
     url = data.get("@microsoft.graph.downloadUrl")
     if not url:
         return ("No inline content for this item", 404)
+    # The viewer shell is for *browsers*. curl / wget / fetch / a script-src tag asking for
+    # this same link want the file, not a page that would render it — returning the shell
+    # there means `curl <raw link>` on a .js or .html hands back viewer boilerplate instead
+    # of the source. Anything that doesn't ask for HTML gets the raw bytes.
+    if not wants_html():
+        return proxy_bytes(url, data.get("name"), cache="public, max-age=3600")
     return render_template_string(VIEW_HTML, url=url, name=data.get("name", "file"))
+
+
+def wants_html():
+    """True only for a client that actually asked for HTML (i.e. a browser navigation)."""
+    accept = request.headers.get("Accept", "")
+    if not accept or accept.strip() == "*/*":
+        return False            # curl's default, and script-src / fetch with no Accept
+    return "text/html" in accept or "application/xhtml+xml" in accept
 
 
 @app.route("/text")
@@ -1048,31 +1088,75 @@ def upload_small():
                     "size": res.get("size", len(data))})
 
 
-class SizedStream:
+class PipedBody:
     """
-    A read()-able that also reports its length.
+    Forward a request body browser -> host -> Microsoft with the two legs overlapped.
 
-    Handing `requests` a bare stream makes it fall back to `Transfer-Encoding: chunked`,
-    which Microsoft's upload sessions reject outright (and which the fragment protocol
-    can't express anyway — it needs Content-Range against a known size). Exposing __len__
-    lets requests set a real Content-Length and still stream the body through.
+    requests pulls from a read()able body in 16 KiB bites, so a naive read-through wrapper
+    becomes a lock-step ping-pong: read 16 KiB off the browser socket, write 16 KiB to
+    Microsoft, repeat. That is ~32k serialised round trips for a 512 MB file with never
+    more than 16 KiB in flight in either direction — which is why turbo ended up SLOWER
+    than uploading straight to Microsoft, worst of all on a remote host like Wasmer where
+    every one of those trips pays real latency.
+
+    Instead a reader thread fills a bounded queue while requests drains it, so both legs
+    run at once and each upstream write is one large sendall(). Host memory is capped by
+    the queue (a few MiB), not by the fragment size.
+
+    Exposes __len__ (requests then sets a real Content-Length — upload sessions reject
+    chunked encoding) and __iter__, but deliberately NOT read(): http.client only takes
+    the one-sendall-per-block path for an iterable it cannot read() from.
     """
+
+    BLOCK = 512 * 1024      # one sendall() per block
+    DEPTH = 8               # ~4 MiB in flight between the legs
 
     def __init__(self, stream, length):
-        self._s, self._len = stream, length
+        self._len = length
+        self._q = queue.Queue(maxsize=self.DEPTH)
+        self._err = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _pump(self, stream):
+        left = self._len
+        try:
+            while left > 0 and not self._stop.is_set():
+                block = stream.read(min(self.BLOCK, left))
+                if not block:
+                    break
+                left -= len(block)
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(block, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue        # consumer is busy; don't spin off into the void
+        except Exception as e:           # noqa: BLE001 - surfaced to the caller below
+            self._err = e
+        finally:
+            try:
+                self._q.put(None, timeout=5)
+            except queue.Full:
+                pass
 
     def __len__(self):
         return self._len
 
-    def read(self, n=-1):
-        return self._s.read() if n is None or n < 0 else self._s.read(n)
-
     def __iter__(self):
-        while True:
-            block = self._s.read(64 * 1024)
-            if not block:
-                return
-            yield block
+        try:
+            while True:
+                block = self._q.get()
+                if block is None:
+                    break
+                yield block
+            if self._err:
+                raise self._err
+        finally:
+            # Upstream died (or we were cancelled): let the reader thread go instead of
+            # leaving it parked on a full queue forever.
+            self._stop.set()
 
 
 @app.route("/upload/proxy", methods=["PUT"])
@@ -1094,9 +1178,10 @@ def upload_proxy():
     for h in ("Content-Range", "Content-Type"):
         if request.headers.get(h):
             headers[h] = request.headers[h]
-    # Stream it through with a known length: no host-side buffering, no chunked encoding.
+    # Pipelined pass-through with a known length: the legs overlap, host memory stays
+    # bounded, and the upstream sees Content-Length rather than chunked encoding.
     length = request.content_length
-    body = SizedStream(request.stream, length) if length else request.get_data()
+    body = PipedBody(request.stream, length) if length else request.get_data()
     try:
         r = S.put(upload_url, headers=headers, data=body, timeout=600)
     except requests.RequestException as e:
@@ -1124,6 +1209,168 @@ def upload_cancel():
         return jsonify({"ok": r.status_code in (200, 204, 404)})
     except requests.RequestException as e:
         return jsonify({"ok": False, "error": str(e)}), 502
+
+
+# ── Turbo: one continuous browser->host stream, host drives the fragment protocol ──
+# Fragment size for the host-driven path. Overlap hides the per-fragment round trip, so
+# this no longer needs to be huge to amortise latency — it only sets the buffer bound.
+STREAM_FRAGMENT = int(os.environ.get("STREAM_FRAGMENT", 10 * 1024 * 1024))
+STREAM_QUEUE = 2          # fragments buffered on the host (~2x STREAM_FRAGMENT)
+
+
+def drain(stream, limit=256 * 1024 * 1024, seconds=20):
+    """
+    Swallow whatever the client is still sending before answering early.
+
+    Responding to a PUT while the client is mid-body leaves it writing into a socket that
+    is no longer being read: its TCP buffers fill and it blocks indefinitely instead of
+    seeing our error. Bounded so a giant or stalled upload can't pin the worker either —
+    past the bound we just stop and let the connection close under the client.
+    """
+    end = time.time() + seconds
+    read = 0
+    try:
+        while read < limit and time.time() < end:
+            block = stream.read(512 * 1024)
+            if not block:
+                break
+            read += len(block)
+    except Exception:       # noqa: BLE001 - draining is best-effort by definition
+        pass
+    return read
+
+
+@app.route("/upload/stream", methods=["PUT"])
+@require_auth
+def upload_stream():
+    """
+    Upload a whole file in ONE request from the browser, with the host running the
+    resumable-session protocol against Microsoft.
+
+    Why this exists: OneDrive fragments must be sent strictly in order, and Microsoft only
+    answers a fragment once it has committed it. With the browser doing the fragmenting it
+    sits completely idle for that entire round trip, once per fragment — for a 512 MB file
+    that is dozens of stalls, and it is why routing through the host ended up SLOWER than
+    uploading straight to Microsoft instead of faster.
+
+    Here the browser streams continuously at LAN speed while a reader thread fills the next
+    fragment in the background and the main thread ships the current one upstream. The
+    stall is overlapped with transfer instead of added to it. Host memory stays bounded at
+    roughly STREAM_QUEUE x STREAM_FRAGMENT no matter how big the file is.
+
+    On failure it reports the session url and how far Microsoft actually got, so the
+    browser can resume rather than start the whole file again.
+    """
+    parent = request.args.get("parent_id", "root")
+    name = request.args.get("name")
+    size = int(request.args.get("size") or request.content_length or 0)
+    if not name or size <= 0:
+        return jsonify({"ok": False, "error": "missing name/size"}), 400
+
+    upload_url = request.args.get("url")          # resuming a session we handed out earlier
+    committed = int(request.args.get("offset") or 0)
+    if not upload_url:
+        res = gpost(f"{_item_path(parent, name)}/createUploadSession",
+                    {"item": {"@microsoft.graph.conflictBehavior": "replace", "name": name}})
+        if "uploadUrl" not in res:
+            err = res.get("error", res)
+            code = (err or {}).get("code") if isinstance(err, dict) else None
+            status = 429 if code in ("activityLimitReached", "serviceNotAvailable") else 502
+            return jsonify({"ok": False, "error": err, "retryable": status == 429}), status
+        upload_url = res["uploadUrl"]
+
+    fragments = queue.Queue(maxsize=STREAM_QUEUE)
+    read_err = {"e": None}
+    stop = threading.Event()
+    # Bind the stream HERE: `request` is a thread-local proxy, so touching it inside the
+    # reader thread raises "Working outside of request context" — the thread then dies
+    # instantly, we answer in milliseconds, and the client is left pushing the whole file
+    # into a socket nobody is reading (a hang, not an error).
+    src = request.stream
+
+    def fill():
+        """Read the browser leg continuously, handing off whole fragments."""
+        stream, left = src, size - committed
+        try:
+            while left > 0 and not stop.is_set():
+                want = min(STREAM_FRAGMENT, left)
+                buf = bytearray()
+                while len(buf) < want:
+                    block = stream.read(min(512 * 1024, want - len(buf)))
+                    if not block:
+                        break
+                    buf.extend(block)
+                if not buf:
+                    break
+                left -= len(buf)
+                while not stop.is_set():
+                    try:
+                        fragments.put(bytes(buf), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:                      # noqa: BLE001 - reported to the client
+            read_err["e"] = e
+        finally:
+            try:
+                fragments.put(None, timeout=5)
+            except queue.Full:
+                pass
+
+    reader = threading.Thread(target=fill, daemon=True)
+    reader.start()
+
+    offset, item = committed, None
+    try:
+        while True:
+            frag = fragments.get()
+            if frag is None:
+                break
+            end = offset + len(frag) - 1
+            headers = {"Content-Range": f"bytes {offset}-{end}/{size}",
+                       "Content-Length": str(len(frag))}
+            last = None
+            for attempt in range(GRAPH_RETRIES + 1):
+                try:
+                    r = S.put(upload_url, headers=headers, data=frag, timeout=600)
+                except requests.RequestException as e:
+                    last = str(e)
+                    if attempt == GRAPH_RETRIES:
+                        break
+                    time.sleep(min(0.5 * (2 ** attempt), 8.0))
+                    continue
+                if r.status_code in (200, 201):
+                    item = _json(r)
+                    offset = end + 1
+                    last = None
+                    break
+                if r.status_code == 202:
+                    offset = end + 1
+                    last = None
+                    break
+                last = f"HTTP {r.status_code}: {r.text[:200]}"
+                if r.status_code not in RETRY_STATUS or attempt == GRAPH_RETRIES:
+                    break
+                time.sleep(retry_after(r, attempt))
+            if last:
+                stop.set()
+                drain(src)
+                return jsonify({"ok": False, "error": last, "uploadUrl": upload_url,
+                                "offset": offset, "resumable": True}), 502
+    finally:
+        stop.set()
+
+    if read_err["e"]:
+        drain(src)
+        return jsonify({"ok": False, "error": f"client stream: {read_err['e']}",
+                        "uploadUrl": upload_url, "offset": offset, "resumable": True}), 400
+    if offset < size:
+        drain(src)
+        return jsonify({"ok": False, "error": "client sent fewer bytes than declared",
+                        "uploadUrl": upload_url, "offset": offset, "resumable": True}), 400
+    return jsonify({"ok": True, "id": (item or {}).get("id"),
+                    "name": (item or {}).get("name", name),
+                    "size": (item or {}).get("size", size)})
 
 
 @app.route("/")
@@ -2081,9 +2328,18 @@ function audioPlayer(body,src,it){
 let TURBO=false;
 let SMALL_MAX=8*1024*1024;         // server-provided; files at/below this go in one PUT
 const CHUNK_DIRECT=10*1024*1024;   // 10 MiB (=32x320KiB)
-const CHUNK_TURBO = 8*1024*1024;   // 8 MiB: the host streams it through, so a big buffer
-                                   // buys nothing and only stalls progress + host memory
-const SMALL_PARALLEL=3;            // small files ride concurrently; large ones go one at a time
+// 20 MiB (=64x320KiB). Every fragment costs a full round trip plus Microsoft's commit,
+// so halving the fragment size doubles that dead time: a 512 MB file is 26 fragments at
+// 20 MiB but 64 at 8 MiB. The host pipelines the body through a bounded queue, so a large
+// fragment no longer costs host memory.
+const CHUNK_TURBO =20*1024*1024;
+const SMALL_PARALLEL=3;            // small files ride concurrently
+// A single OneDrive upload session is strictly sequential (fragments must go in order, and
+// Microsoft only acks one once committed), so ONE file cannot exceed what a single stream
+// to Microsoft sustains — roughly 40-45 MB/s here. Separate files are separate sessions
+// though, so uploading a few at once does scale past that. Tunable from the console:
+//   BIG_PARALLEL = 4
+let BIG_PARALLEL=2;
 const MAX_TRIES=5;
 
 function toggleTurbo(){ TURBO=!TURBO; localStorage.setItem('od_turbo',TURBO?'1':'0'); $('turboBtn').classList.toggle('pri',TURBO); }
@@ -2147,7 +2403,10 @@ async function upload(files){
   await Promise.all(Array.from({length:Math.min(SMALL_PARALLEL,queue.length)},async()=>{
     while(queue.length) await run(queue.shift());
   }));
-  for(const f of big) await run(f);
+  const bigQ=big.slice();
+  await Promise.all(Array.from({length:Math.min(Math.max(1,BIG_PARALLEL),bigQ.length)},async()=>{
+    while(bigQ.length) await run(bigQ.shift());
+  }));
 
   $('utoast').style.display='none';
   if(failures.length){
@@ -2159,7 +2418,8 @@ async function upload(files){
 
 async function uploadOne(file,parent){
   UP.label=file.name; upUI();
-  return file.size<=SMALL_MAX ? uploadSmall(file,parent) : uploadResumable(file,parent);
+  if(file.size<=SMALL_MAX) return uploadSmall(file,parent);
+  return TURBO ? uploadTurbo(file,parent) : uploadResumable(file,parent);
 }
 
 // One request per file. This is what keeps a 25-file drop from tripping the
@@ -2193,6 +2453,60 @@ function putChunkSmall(url,blob,onprog){
     xhr.onerror=()=>resolve({status:0,text:'',retryAfter:null});
     xhr.send(blob);
   });
+}
+
+// Turbo: hand the whole file to the host in ONE request and let it drive Microsoft's
+// fragment protocol. The browser stops idling through every fragment commit — that dead
+// time is what made turbo slower than uploading straight to Microsoft.
+function putStream(url, blob, onprog){
+  return new Promise(resolve=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Content-Type', blob.type||'application/octet-stream');
+    xhr.upload.onprogress=e=>{ if(e.lengthComputable&&onprog) onprog(e.loaded); };
+    xhr.onload=()=>resolve({status:xhr.status,text:xhr.responseText,
+                            retryAfter:xhr.getResponseHeader('Retry-After')});
+    xhr.onerror=()=>resolve({status:0,text:'',retryAfter:null});
+    xhr.send(blob);
+  });
+}
+
+async function uploadTurbo(file,parent){
+  const size=file.size;
+  let url=null, offset=0;
+  for(let t=0;t<MAX_TRIES;t++){
+    const q='/upload/stream?parent_id='+encodeURIComponent(parent)
+      +'&name='+encodeURIComponent(file.name)+'&size='+size
+      +(url?('&url='+encodeURIComponent(url)+'&offset='+offset):'');
+    let last=0;
+    const res=await putStream(q, file.slice(offset), loaded=>{
+      // progress is bytes the host has accepted; it settles to Microsoft's real rate
+      // once the host-side buffer fills and backpressure reaches the browser
+      UP.sent+=loaded-last; last=loaded; upUI();
+    });
+    let body={}; try{ body=JSON.parse(res.text||'{}'); }catch(e){}
+    if(res.status>=200&&res.status<300&&body.ok){
+      UP.sent+=(size-offset)-last; upUI();
+      return {ok:true,item:body.id?{id:body.id,name:body.name||file.name,folder:false,
+              size:body.size!=null?body.size:size,modified:new Date().toISOString()}:null};
+    }
+    UP.sent-=last;                                  // don't count a failed attempt twice
+    // The host tells us how far Microsoft actually got, so a retry resumes rather than
+    // re-sending the whole file.
+    if(body.resumable&&body.uploadUrl){
+      url=body.uploadUrl;
+      if(typeof body.offset==='number'&&body.offset>offset){ offset=body.offset; UP.sent+=offset; }
+    }
+    if(!RETRYABLE(res.status)&&!body.resumable)
+      return {ok:false,error:'HTTP '+res.status+(body.error?' — '+JSON.stringify(body.error).slice(0,120):'')};
+    if(t===MAX_TRIES-1){
+      if(url) await fetch('/upload/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url})}).catch(()=>{});
+      return {ok:false,error:'HTTP '+res.status+' after '+MAX_TRIES+' tries'};
+    }
+    await sleep(backoff(t,res.retryAfter));
+  }
+  return {ok:false,error:'exhausted retries'};
 }
 
 async function uploadResumable(file,parent){

@@ -25,8 +25,9 @@ straight from Microsoft's CDN**, an Ace code editor, and custom media players.
   tripping Graph's burst throttle. Every request retries with backoff on 429/5xx (honouring
   `Retry-After`), and a file that still fails has its session cancelled so it can't leave a
   0-byte stub behind. Optional **⚡ Turbo** routes through the host for local/unlimited deploys;
-  the host *streams* fragments through rather than buffering them, so host memory stays flat
-  regardless of fragment size.
+  In **Turbo** the browser sends the file in ONE continuous request and the *host* drives
+  Microsoft's fragment protocol, so the browser never idles through a fragment commit. A failed
+  upload comes back with the committed offset and resumes rather than restarting.
   *OneDrive rejects parallel fragments, so S3-style multi-stream within one file is impossible —
   this is measured.*
 - **Editor** — dark Ace editor for text/code with save; full-permission HTML preview.
@@ -124,10 +125,25 @@ guaranteed-stable deploy, **self-host** (e.g. a home server / Pi) and reach it p
 - Works on personal OneDrive and work/school tenants that permit device-code flow + user consent.
   Locked-down tenants (Conditional Access blocking device code, or disabled user consent) will refuse
   sign-in — that's a tenant policy, not a bug.
-- Single-stream browser upload tops out around ~13 MB/s (OneDrive HTTP/2 flow control); Turbo ~2×.
+- **Upload throughput, honestly.** A OneDrive upload session is strictly sequential: fragments
+  must arrive in order and Microsoft only acks one once it has committed it. So a *single file*
+  cannot go faster than one TCP stream to Microsoft sustains, and no amount of client work
+  changes that. What Turbo buys is removing the per-fragment stall — with the browser doing the
+  fragmenting it sits idle for a full round trip once per fragment (dozens of times in a 512 MB
+  file), which is why routing through the host used to end up *slower* than going direct.
+  To actually exceed one stream, upload **several files at once**: those are separate sessions and
+  do scale. Large files run 2 at a time by default (`BIG_PARALLEL` in the console to change it).
+- Single-stream throughput is bounded by bandwidth×delay, not just bandwidth — this host measures
+  ~45 MB/s to a nearby endpoint but ~1.5 MB/s single-stream to a distant one. If Turbo is slower
+  than direct for you, the host's path to Microsoft is the narrower one, and direct is the right
+  choice; the toggle exists because which one wins depends on where you run it.
 - Microsoft's download token is **attachment-only** by design — there is no URL tweak for an inline
   "raw" view (the token signs the query string; edits return 401). The **Raw link** button copies a
   `/view?id=…` URL: a ~3 KB HTML shell that renders the file via a media tag / `fetch`→blob pointing
   **straight at the CDN**, so the bytes go browser↔CDN direct — **zero host egress**, renders inline
   instead of downloading, and never expires (re-signs each load). (`/raw?id=…` still exists as a
   byte-level inline proxy for when you need a direct-bytes URL, e.g. embedding in someone else's `<img>`.)
+- **Raw links serve source to non-browsers.** `/view` returns the viewer shell only to clients that
+  ask for HTML. `curl`, `wget`, `fetch` and script/style tags get the **file itself**, with a content
+  type derived from its name — so `curl <raw link>` on a `.js` or `.html` gives you the source, not
+  viewer boilerplate, and a raw `.js` link is loadable from a script tag. Same for `/raw`.

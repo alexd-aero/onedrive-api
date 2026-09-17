@@ -110,12 +110,19 @@ if files:
     ok("/stream range (206)", sr.status_code == 206)
     rw = s.get(f"{BASE}/raw?id={fid}", headers={"Range": "bytes=0-63"}, timeout=30)
     ok("/raw inline + range", rw.status_code == 206 and rw.headers.get("Content-Disposition") == "inline")
-    vw = s.get(f"{BASE}/view?id={fid}", timeout=30)
+    # A browser navigation gets the viewer shell...
+    vw = s.get(f"{BASE}/view?id={fid}", timeout=30,
+               headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
     # The shell must embed whatever signed url /link handed out — matching Microsoft's real
     # CDN host exactly would make this unrunnable against tests/mock_graph.py.
     cdn_host = urlparse(lk.get("url", "")).netloc
     ok("/view shell renders + embeds the signed CDN url",
        vw.status_code == 200 and bool(cdn_host) and cdn_host in vw.text, cdn_host)
+    # ...while curl / fetch / a script tag get the file itself, not viewer boilerplate.
+    rawv = s.get(f"{BASE}/view?id={fid}", timeout=30, headers={"Accept": "*/*"})
+    ok("/view serves raw source to non-browser clients",
+       rawv.status_code == 200 and "<!DOCTYPE html>" not in rawv.text[:200],
+       rawv.headers.get("Content-Type", ""))
 
 # ── 5. Concurrency ────────────────────────────────────────────────────────────
 print("\n[5] Concurrency — 25 parallel authed /ls")
